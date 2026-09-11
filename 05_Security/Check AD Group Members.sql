@@ -1,0 +1,1 @@
+EXEC master.dbo.xp_logininfo 'PRG-DC\GDLPRGDC-LIPPERT', 'members'
