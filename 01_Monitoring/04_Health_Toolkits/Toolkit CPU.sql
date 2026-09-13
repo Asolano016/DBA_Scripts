@@ -1,314 +1,179 @@
 /******************************************************************************
 SQL SERVER CPU HEALTH CHECK & TROUBLESHOOTING GUIDE
 -------------------------------------------------------------------------------
-
 PURPOSE
 
-This toolkit provides a structured approach for investigating
-CPU-related performance issues in SQL Server.
+This toolkit provides a structured approach for investigating CPU-related
+performance bottlenecks, scheduler pressure, parallelism issues, and compilation overhead.
+
+TARGET COMPATIBILITY
+    SQL Server 2019 and later (Enterprise, Standard, Developer)
+
+SAFETY & PERMISSIONS
+    Read-Only diagnostic script.
+    Requires: VIEW SERVER STATE (SQL 2019) / VIEW SERVER PERFORMANCE STATE (SQL 2022)
 
 AREAS COVERED
 
-1. SQL Server CPU Utilization
-2. Current CPU Pressure Validation
-3. Active CPU Consumers
-4. Historical Top CPU Queries
+1. SQL Server CPU Utilization History (Recent Minutes)
+2. Scheduler Health & Runnable Task Queues
+3. Active CPU Consuming Requests
+4. Historical Top CPU Queries (Statement Level)
 5. Top CPU Stored Procedures
-6. CPU Usage by Database
-7. CPU Intensive Execution Plans
-8. Scheduler Health
-9. Runnable Queue Analysis
-10. SOS_SCHEDULER_YIELD Analysis
-11. Processor Queue Analysis
-12. Parallelism Configuration
-13. Parallelism Waits
-14. Compilation Activity
-15. Plan Cache Efficiency
-16. Missing Index Impact
-17. CPU Wait Statistics
-18. Executive Summary
+6. CPU Usage Aggregation by Database
+7. Execution Plans for Active CPU Consumers
+8. Scheduler Detailed Worker Distribution
+9. SOS_SCHEDULER_YIELD & Yield Analysis
+10. Schedulers with Pending Disk I/O
+11. Server Parallelism Configuration (MAXDOP / Cost Threshold)
+12. Parallelism Wait Analysis (CXPACKET vs CXCONSUMER)
+13. SQL Compilations vs Batch Requests (Cumulative)
+14. Plan Cache Efficiency & Ad-Hoc Bloat
+15. Missing Index Impact on CPU
+16. CPU-Related Filtered Wait Statistics
+17. Executive Summary & Triage Matrix
 
-HOW TO USE
+RECOMMENDED TROUBLESHOOTING FLOW
 
-Recommended troubleshooting flow:
-
-    1. Executive Summary
-    2. CPU Utilization
-    3. Scheduler Health
-    4. Runnable Queues
-    5. Active CPU Consumers
-    6. Historical CPU Consumers
-    7. Wait Analysis
-    8. Parallelism
-    9. Compilation Analysis
-    10. Plan Cache Review
+    1. Executive Summary & CPU Utilization
+    2. Scheduler Health & Runnable Queues
+    3. Active CPU Requests & Historical Top Queries
+    4. Parallelism & Compilation Efficiency
 
 ******************************************************************************/
 
-/*-------------------------------------------------------------------------------
+/*-----------------------------------------------------------------------------
     SECTION 1
-    SQL SERVER CPU UTILIZATION
+    SQL SERVER CPU UTILIZATION HISTORY (RECENT MINUTES)
 -------------------------------------------------------------------------------
-
 .PURPOSE
-
-    Obtain a quick snapshot of SQL Server CPU utilization.
+    Extract recent CPU utilization percentages for SQL Server and System Idle.
 
 .WHY THIS MATTERS
-
-    Helps determine whether SQL Server is actively consuming CPU.
+    Differentiates whether high CPU is caused by SQL Server or external OS processes.
 
 .KEY METRICS
-
     SQLProcessUtilization
-
+    OtherProcessUtilization
     SystemIdle
+-----------------------------------------------------------------------------*/
 
-.HEALTHY
+DECLARE @ts_now BIGINT = (SELECT cpu_ticks / (cpu_ticks / ms_ticks) FROM sys.dm_os_sys_info);
 
-    SQLProcessUtilization stable.
-
-    SystemIdle comfortably above zero.
-
-.WARNING
-
-    SQLProcessUtilization remains consistently high.
-
-    SystemIdle remains consistently low.
-
-.POSSIBLE CAUSES
-
-    Expensive queries.
-    Parallelism.
-    Missing indexes.
-    Compilation pressure.
-
-.NEXT ACTIONS
-
-    Review Sections 3, 4 and 8.
-
--------------------------------------------------------------------------------*/
-
-SELECT TOP (1)
+SELECT TOP (10)
+    DATEADD(ms, -1 * (@ts_now - [timestamp]), GETDATE()) AS EventTime,
+    record.value('(./Record/SchedulerMonitorEvent/SystemHealth/ProcessUtilization)[1]', 'INT') AS SQLProcessUtilization,
     record.value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]', 'INT') AS SystemIdle,
-    record.value('(./Record/SchedulerMonitorEvent/SystemHealth/ProcessUtilization)[1]', 'INT') AS SQLProcessUtilization
+    100 - record.value('(./Record/SchedulerMonitorEvent/SystemHealth/ProcessUtilization)[1]', 'INT')
+        - record.value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]', 'INT') AS OtherProcessUtilization
 FROM
 (
-    SELECT CAST(record AS XML) AS record
+    SELECT
+        [timestamp],
+        CAST(record AS XML) AS record
     FROM sys.dm_os_ring_buffers
-    WHERE ring_buffer_type = 'RING_BUFFER_SCHEDULER_MONITOR'
-        AND record LIKE '%<SystemHealth>%'
-) x
-ORDER BY record.value('(./Record/@id)[1]', 'INT') DESC;
+    WHERE ring_buffer_type = N'RING_BUFFER_SCHEDULER_MONITOR'
+      AND record LIKE N'%<SystemHealth>%'
+) AS rb
+ORDER BY [timestamp] DESC;
 GO
 
-/*-------------------------------------------------------------------------------
+/*-----------------------------------------------------------------------------
     SECTION 2
-    CURRENT CPU PRESSURE VALIDATION
+    SCHEDULER HEALTH & RUNNABLE TASK QUEUES
 -------------------------------------------------------------------------------
-
 .PURPOSE
-
-    Determine whether SQL Server is truly CPU bound.
+    Determine whether SQL Server is actively CPU bound across schedulers.
 
 .WHY THIS MATTERS
-
-    High CPU usage alone does not necessarily indicate CPU pressure.
-
-.KEY METRICS
-
-    RunnableTasks
+    Runnable tasks > 0 indicate threads waiting for CPU time slice.
 
 .HEALTHY
-
-    RunnableTasks remain low.
+    RunnableTasks is 0 or low single digits across schedulers.
 
 .WARNING
-
-    RunnableTasks continuously growing.
-
-.POSSIBLE CAUSES
-
-    CPU saturation.
-    Excessive parallelism.
-    Excessive workload concurrency.
-
-.NEXT ACTIONS
-
-    Review Sections 8, 9 and 10.
-
--------------------------------------------------------------------------------*/
+    RunnableTasks continuously exceeds 1-2 per visible scheduler.
+-----------------------------------------------------------------------------*/
 
 SELECT
-    SUM(runnable_tasks_count) AS RunnableTasks,
-    SUM(current_tasks_count) AS CurrentTasks,
-    SUM(active_workers_count) AS ActiveWorkers
+    SUM(runnable_tasks_count) AS TotalRunnableTasks,
+    SUM(current_tasks_count) AS TotalCurrentTasks,
+    SUM(active_workers_count) AS TotalActiveWorkers,
+    SUM(work_queue_count) AS TotalWorkQueueCount
 FROM sys.dm_os_schedulers
-WHERE scheduler_id < 255;
-
+WHERE scheduler_id < 255
+  AND status = 'VISIBLE ONLINE';
 GO
 
-/*-------------------------------------------------------------------------------
+/*-----------------------------------------------------------------------------
     SECTION 3
-    ACTIVE CPU CONSUMERS
+    ACTIVE CPU CONSUMING REQUESTS
 -------------------------------------------------------------------------------
-
 .PURPOSE
-
-    Show currently executing requests consuming CPU.
-
-.WHY THIS MATTERS
-
-    Useful during active incidents or performance degradation.
-
-.KEY METRICS
-
-    cpu_time
-
-    total_elapsed_time
-
-    wait_type
-
-.HEALTHY
-
-    CPU usage distributed across multiple sessions.
-
-.WARNING
-
-    One or a few sessions dominate CPU consumption.
-
-.POSSIBLE CAUSES
-
-    Runaway queries.
-    Large scans.
-    Poor execution plans.
-
-.NEXT ACTIONS
-
-    Capture execution plans.
-    Review wait types.
-
--------------------------------------------------------------------------------*/
+    Show currently executing requests consuming CPU time.
+-----------------------------------------------------------------------------*/
 
 SELECT
     r.session_id,
     r.status,
-    r.cpu_time,
-    r.total_elapsed_time,
+    r.cpu_time AS CPUTimeMs,
+    r.total_elapsed_time AS ElapsedTimeMs,
+    r.logical_reads AS LogicalReads,
     r.command,
     r.wait_type,
+    r.wait_time AS WaitTimeMs,
     r.blocking_session_id,
     DB_NAME(r.database_id) AS DatabaseName,
-    t.text
+    SUBSTRING(
+        st.text,
+        (r.statement_start_offset / 2) + 1,
+        ((CASE r.statement_end_offset
+            WHEN -1 THEN DATALENGTH(st.text)
+            ELSE r.statement_end_offset
+         END - r.statement_start_offset) / 2) + 1
+    ) AS StatementText
 FROM sys.dm_exec_requests r
-CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t
+CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) st
 WHERE r.session_id > 50
+  AND r.session_id <> @@SPID
 ORDER BY r.cpu_time DESC;
-
 GO
 
-/*-------------------------------------------------------------------------------
+/*-----------------------------------------------------------------------------
     SECTION 4
-    HISTORICAL TOP CPU QUERIES
+    HISTORICAL TOP CPU QUERIES (STATEMENT LEVEL)
 -------------------------------------------------------------------------------
-
 .PURPOSE
-
-    Identify historically expensive CPU consumers.
-
-.WHY THIS MATTERS
-
-    A small number of queries often account for most CPU usage.
-
-.KEY METRICS
-
-    TotalCPUms
-
-    AvgCPUms
-
-    ExecutionCount
-
-.HEALTHY
-
-    CPU usage evenly distributed across workload.
-
-.WARNING
-
-    Small number of queries dominate total CPU.
-
-.POSSIBLE CAUSES
-
-    Missing indexes.
-    Poor plans.
-    Large scans.
-
-.NEXT ACTIONS
-
-    Review execution plans.
-    Review indexes.
-
--------------------------------------------------------------------------------*/
+    Identify historically expensive queries by total CPU worker time.
+-----------------------------------------------------------------------------*/
 
 SELECT TOP (20)
     qs.execution_count,
     qs.total_worker_time / 1000 AS TotalCPUms,
-    (qs.total_worker_time / qs.execution_count) / 1000 AS AvgCPUms,
-    qs.total_logical_reads,
-    qs.total_logical_writes,
-    SUBSTRING
-    (
+    (qs.total_worker_time / NULLIF(qs.execution_count, 0)) / 1000 AS AvgCPUms,
+    qs.total_logical_reads AS TotalLogicalReads,
+    (qs.total_logical_reads / NULLIF(qs.execution_count, 0)) AS AvgLogicalReads,
+    qs.last_execution_time,
+    SUBSTRING(
         st.text,
-        (qs.statement_start_offset/2)+1,
-        (
-            (
-                CASE qs.statement_end_offset
-                    WHEN -1 THEN DATALENGTH(st.text)
-                    ELSE qs.statement_end_offset
-                END
-                - qs.statement_start_offset
-            ) / 2
-        ) + 1
-    ) AS QueryText
+        (qs.statement_start_offset / 2) + 1,
+        ((CASE qs.statement_end_offset
+            WHEN -1 THEN DATALENGTH(st.text)
+            ELSE qs.statement_end_offset
+         END - qs.statement_start_offset) / 2) + 1
+    ) AS StatementText
 FROM sys.dm_exec_query_stats qs
 CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
 ORDER BY qs.total_worker_time DESC;
-
 GO
 
-/*-------------------------------------------------------------------------------
+/*-----------------------------------------------------------------------------
     SECTION 5
     TOP CPU STORED PROCEDURES
 -------------------------------------------------------------------------------
-
 .PURPOSE
-
-    Identify stored procedures consuming the most CPU.
-
-.WHY THIS MATTERS
-
-    Stored procedures often account for the majority of OLTP workload.
-
-.HEALTHY
-
-    CPU utilization distributed across procedures.
-
-.WARNING
-
-    Same procedures repeatedly dominate CPU usage.
-
-.POSSIBLE CAUSES
-
-    Poor procedure design.
-    Missing indexes.
-    Parameter sniffing.
-
-.NEXT ACTIONS
-
-    Capture execution plans.
-    Review statistics.
-    Review indexes.
-
--------------------------------------------------------------------------------*/
+    Identify stored procedures consuming the most CPU time.
+-----------------------------------------------------------------------------*/
 
 SELECT TOP (20)
     DB_NAME(database_id) AS DatabaseName,
@@ -317,48 +182,23 @@ SELECT TOP (20)
     last_execution_time,
     execution_count,
     total_worker_time / 1000 AS TotalCPUms,
-    (total_worker_time / execution_count) / 1000 AS AvgCPUms
+    (total_worker_time / NULLIF(execution_count, 0)) / 1000 AS AvgCPUms
 FROM sys.dm_exec_procedure_stats
 ORDER BY total_worker_time DESC;
-
 GO
 
-/*-------------------------------------------------------------------------------
+/*-----------------------------------------------------------------------------
     SECTION 6
-    CPU USAGE BY DATABASE
+    CPU USAGE AGGREGATION BY DATABASE
 -------------------------------------------------------------------------------
-
 .PURPOSE
+    Estimate CPU utilization aggregated across cached plans by database.
+-----------------------------------------------------------------------------*/
 
-    Estimate CPU utilization by database.
-
-.WHY THIS MATTERS
-
-    Helps identify databases responsible for CPU pressure.
-
-.HEALTHY
-
-    CPU utilization aligns with expected workload.
-
-.WARNING
-
-    A single database dominates CPU consumption.
-
-.POSSIBLE CAUSES
-
-    Heavy reporting workload.
-    Batch processing.
-    Poorly tuned queries.
-
-.NEXT ACTIONS
-
-    Focus tuning efforts on affected databases.
-
--------------------------------------------------------------------------------*/
-
-SELECT
-    DB_NAME(CAST(pa.value AS INT)) AS DatabaseName,
-    SUM(qs.total_worker_time) / 1000 AS TotalCPUms
+SELECT TOP (20)
+    COALESCE(DB_NAME(CAST(pa.value AS INT)), 'Ad-hoc / Prepared') AS DatabaseName,
+    SUM(qs.total_worker_time) / 1000 AS TotalCPUms,
+    SUM(qs.execution_count) AS TotalExecutions
 FROM sys.dm_exec_query_stats qs
 CROSS APPLY sys.dm_exec_plan_attributes(qs.plan_handle) pa
 WHERE pa.attribute = 'dbid'
@@ -366,222 +206,86 @@ GROUP BY CAST(pa.value AS INT)
 ORDER BY TotalCPUms DESC;
 GO
 
-
-/*-------------------------------------------------------------------------------
+/*-----------------------------------------------------------------------------
     SECTION 7
-    CPU INTENSIVE EXECUTION PLANS
+    EXECUTION PLANS FOR ACTIVE CPU CONSUMERS
 -------------------------------------------------------------------------------
-
 .PURPOSE
+    Retrieve execution plans for currently active queries consuming high CPU.
+-----------------------------------------------------------------------------*/
 
-    Retrieve execution plans for active CPU consumers.
-
-.WHY THIS MATTERS
-
-    CPU issues are usually identified in the execution plan.
-
-.KEY OPERATORS
-
-    Table Scan
-    Index Scan
-    Sort
-    Hash Match
-    Parallelism
-
-.WARNING
-
-    Large scans and expensive operators.
-
-.NEXT ACTIONS
-
-    Compare estimated versus actual rows.
-    Review indexing strategy.
-
--------------------------------------------------------------------------------*/
-
-SELECT
+SELECT TOP (5)
     r.session_id,
-    r.cpu_time,
-    t.text,
+    r.cpu_time AS CPUTimeMs,
+    r.total_elapsed_time AS ElapsedTimeMs,
+    DB_NAME(r.database_id) AS DatabaseName,
+    SUBSTRING(
+        st.text,
+        (r.statement_start_offset / 2) + 1,
+        ((CASE r.statement_end_offset
+            WHEN -1 THEN DATALENGTH(st.text)
+            ELSE r.statement_end_offset
+         END - r.statement_start_offset) / 2) + 1
+    ) AS StatementText,
     qp.query_plan
 FROM sys.dm_exec_requests r
-CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t
-CROSS APPLY sys.dm_exec_query_plan(r.plan_handle) qp
+CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) st
+OUTER APPLY sys.dm_exec_query_plan(r.plan_handle) qp
 WHERE r.session_id > 50
+  AND r.session_id <> @@SPID
+ORDER BY r.cpu_time DESC
 OPTION (MAXDOP 1);
-
 GO
 
-/*-------------------------------------------------------------------------------
+/*-----------------------------------------------------------------------------
     SECTION 8
-    SCHEDULER HEALTH
+    SCHEDULER DETAILED WORKER DISTRIBUTION
 -------------------------------------------------------------------------------
-
 .PURPOSE
-
-    Review SQL Server scheduler activity.
-
-.WHY THIS MATTERS
-
-    Scheduler pressure is one of the strongest indicators of CPU bottlenecks.
-
-.KEY METRICS
-
-    runnable_tasks_count
-
-    current_tasks_count
-
-    active_workers_count
-
-.HEALTHY
-
-    Runnable queues remain low.
-
-.WARNING
-
-    High runnable task counts across schedulers.
-
-.POSSIBLE CAUSES
-
-    CPU saturation.
-    Parallelism.
-    Excessive workload.
-
-.NEXT ACTIONS
-
-    Review Sections 9 and 10.
-
--------------------------------------------------------------------------------*/
+    Review workload balance across visible online CPU schedulers.
+-----------------------------------------------------------------------------*/
 
 SELECT
     scheduler_id,
     cpu_id,
     status,
+    is_online,
     current_tasks_count,
     runnable_tasks_count,
-    active_workers_count
+    active_workers_count,
+    work_queue_count,
+    pending_disk_io_count
 FROM sys.dm_os_schedulers
 WHERE scheduler_id < 255
-ORDER BY runnable_tasks_count DESC;
-
+ORDER BY runnable_tasks_count DESC, scheduler_id;
 GO
 
-/*-------------------------------------------------------------------------------
+/*-----------------------------------------------------------------------------
     SECTION 9
-    RUNNABLE QUEUE ANALYSIS
+    SOS_SCHEDULER_YIELD & YIELD ANALYSIS
 -------------------------------------------------------------------------------
-
 .PURPOSE
-
-    Identify schedulers experiencing CPU pressure.
-
-.WHY THIS MATTERS
-
-    Runnable tasks waiting for CPU are one of the best indicators
-    of CPU bottlenecks.
-
-.HEALTHY
-
-    RunnableTasks close to zero.
-
-.WARNING
-
-    RunnableTasks continuously above zero.
-
-.POSSIBLE CAUSES
-
-    CPU saturation.
-    Parallel workloads.
-    Excessive concurrent activity.
-
-.NEXT ACTIONS
-
-    Review active CPU consumers.
-    Review parallelism configuration.
-
--------------------------------------------------------------------------------*/
+    Review SOS_SCHEDULER_YIELD waits indicating CPU-bound execution quantum loops.
+-----------------------------------------------------------------------------*/
 
 SELECT
-    scheduler_id,
-    runnable_tasks_count
-FROM sys.dm_os_schedulers
-WHERE scheduler_id < 255
-    AND runnable_tasks_count > 0
-ORDER BY runnable_tasks_count DESC;
-
-GO
-
-/*-------------------------------------------------------------------------------
-    SECTION 10
-    SOS_SCHEDULER_YIELD ANALYSIS
--------------------------------------------------------------------------------
-
-.PURPOSE
-
-    Detect CPU-bound workloads.
-
-.WHY THIS MATTERS
-
-    SOS_SCHEDULER_YIELD is one of the most common waits
-    associated with CPU pressure.
-
-.HEALTHY
-
-    Present but not dominant.
-
-.WARNING
-
-    One of the highest waits in the system.
-
-.POSSIBLE CAUSES
-
-    CPU bottlenecks.
-    Large scans.
-    Missing indexes.
-
-.NEXT ACTIONS
-
-    Review Sections 4, 8 and 9.
-
--------------------------------------------------------------------------------*/
-
-SELECT *
+    wait_type,
+    waiting_tasks_count,
+    wait_time_ms,
+    signal_wait_time_ms,
+    max_wait_time_ms,
+    CAST(wait_time_ms AS FLOAT) / NULLIF(waiting_tasks_count, 0) AS AvgWaitTimeMs
 FROM sys.dm_os_wait_stats
 WHERE wait_type = 'SOS_SCHEDULER_YIELD';
-
 GO
 
-/*-------------------------------------------------------------------------------
-    SECTION 11
-    PROCESSOR QUEUE ANALYSIS
+/*-----------------------------------------------------------------------------
+    SECTION 10
+    SCHEDULERS WITH PENDING DISK I/O
 -------------------------------------------------------------------------------
-
 .PURPOSE
-
-    Review pending requests waiting for schedulers.
-
-.WHY THIS MATTERS
-
-    High queue lengths indicate CPU pressure.
-
-.HEALTHY
-
-    Low pending task counts.
-
-.WARNING
-
-    Large pending task counts.
-
-.POSSIBLE CAUSES
-
-    CPU saturation.
-    Excessive concurrency.
-
-.NEXT ACTIONS
-
-    Review scheduler pressure.
-
--------------------------------------------------------------------------------*/
+    Identify whether schedulers are blocked waiting on outstanding disk I/O requests.
+-----------------------------------------------------------------------------*/
 
 SELECT
     scheduler_id,
@@ -590,49 +294,22 @@ SELECT
     runnable_tasks_count
 FROM sys.dm_os_schedulers
 WHERE scheduler_id < 255
-ORDER BY runnable_tasks_count DESC;
-
+  AND pending_disk_io_count > 0
+ORDER BY pending_disk_io_count DESC;
 GO
 
-/*-------------------------------------------------------------------------------
-    SECTION 12
-    PARALLELISM CONFIGURATION
+/*-----------------------------------------------------------------------------
+    SECTION 11
+    SERVER PARALLELISM CONFIGURATION
 -------------------------------------------------------------------------------
-
 .PURPOSE
-
-    Review server-level parallelism configuration.
-
-.KEY SETTINGS
-
-    max degree of parallelism
-
-    cost threshold for parallelism
-
-.HEALTHY
-
-    Settings aligned with workload requirements.
-
-.WARNING
-
-    MAXDOP misconfigured.
-
-    Cost Threshold too low.
-
-.POSSIBLE CAUSES
-
-    Legacy configurations.
-    Default settings.
-
-.NEXT ACTIONS
-
-    Review parallelism waits.
-
--------------------------------------------------------------------------------*/
+    Review server-level MAXDOP and Cost Threshold for Parallelism settings.
+-----------------------------------------------------------------------------*/
 
 SELECT
     name,
-    value_in_use
+    value_in_use,
+    description
 FROM sys.configurations
 WHERE name IN
 (
@@ -641,95 +318,36 @@ WHERE name IN
 );
 GO
 
-/*-------------------------------------------------------------------------------
-    SECTION 13
-    PARALLELISM WAITS
+/*-----------------------------------------------------------------------------
+    SECTION 12
+    PARALLELISM WAIT ANALYSIS
 -------------------------------------------------------------------------------
-
 .PURPOSE
-
-    Evaluate waits caused by parallel execution.
-
-.KEY WAITS
-
-    CXPACKET
-
-    CXCONSUMER
-
-.HEALTHY
-
-    Present but not dominant.
-
-.WARNING
-
-    Top waits in environment.
-
-.POSSIBLE CAUSES
-
-    Over-parallelization.
-    Poor execution plans.
-
-.NEXT ACTIONS
-
-    Review MAXDOP configuration.
-    Review execution plans.
-
--------------------------------------------------------------------------------*/
+    Evaluate CXPACKET (coordinator/skew wait) and CXCONSUMER (normal parallel consumer).
+-----------------------------------------------------------------------------*/
 
 SELECT
     wait_type,
+    waiting_tasks_count,
     wait_time_ms,
     signal_wait_time_ms,
-    waiting_tasks_count
+    max_wait_time_ms,
+    CAST(wait_time_ms AS FLOAT) / NULLIF(waiting_tasks_count, 0) AS AvgWaitTimeMs
 FROM sys.dm_os_wait_stats
 WHERE wait_type IN ('CXPACKET', 'CXCONSUMER');
-
 GO
 
-/*-------------------------------------------------------------------------------
-    SECTION 14
-    COMPILATION ACTIVITY
+/*-----------------------------------------------------------------------------
+    SECTION 13
+    SQL COMPILATIONS VS BATCH REQUESTS (CUMULATIVE)
 -------------------------------------------------------------------------------
-
 .PURPOSE
-
-    Evaluate compilation-related CPU overhead.
-
-.WHY THIS MATTERS
-
-    Excessive compilations increase CPU consumption.
-
-.KEY METRICS
-
-    Batch Requests/sec
-
-    SQL Compilations/sec
-
-    SQL Re-Compilations/sec
-
-.HEALTHY
-
-    Batch Requests significantly exceed Compilations.
-
-.WARNING
-
-    High compilation rates.
-
-.POSSIBLE CAUSES
-
-    Adhoc workloads.
-    Recompile hints.
-    Poor parameterization.
-
-.NEXT ACTIONS
-
-    Review plan cache efficiency.
-
--------------------------------------------------------------------------------*/
+    Inspect compilation ratios. Note: These values represent cumulative totals since startup.
+-----------------------------------------------------------------------------*/
 
 SELECT
     counter_name,
-    cntr_value
+    cntr_value AS CumulativeCount
 FROM sys.dm_os_performance_counters
 WHERE counter_name IN
 (
@@ -737,267 +355,109 @@ WHERE counter_name IN
     'SQL Compilations/sec',
     'SQL Re-Compilations/sec'
 );
-
 GO
 
-/*-------------------------------------------------------------------------------
-    SECTION 15
-    PLAN CACHE EFFICIENCY
+/*-----------------------------------------------------------------------------
+    SECTION 14
+    PLAN CACHE EFFICIENCY & AD-HOC BLOAT
 -------------------------------------------------------------------------------
-
 .PURPOSE
-
-    Identify plan cache inefficiencies.
-
-.WHY THIS MATTERS
-
-    Excessive compilations often result from poor plan reuse.
-
-.HEALTHY
-
-    Majority of plans reused.
-
-.WARNING
-
-    Large number of Adhoc plans.
-
-.POSSIBLE CAUSES
-
-    Literal values.
-    Poor parameterization.
-
-.NEXT ACTIONS
-
-    Review Optimize for Ad Hoc Workloads.
-    Review application design.
-
--------------------------------------------------------------------------------*/
+    Identify plan cache memory distribution and single-use plan waste.
+-----------------------------------------------------------------------------*/
 
 SELECT
     objtype,
-    COUNT(*) AS Plans,
-    SUM(size_in_bytes) / 1024 / 1024 AS CacheMB
+    COUNT(*) AS PlanCount,
+    SUM(CAST(size_in_bytes AS BIGINT)) / 1024 / 1024 AS CacheMB,
+    SUM(CASE WHEN usecounts = 1 THEN 1 ELSE 0 END) AS SingleUsePlans
 FROM sys.dm_exec_cached_plans
 GROUP BY objtype
 ORDER BY CacheMB DESC;
-
 GO
 
-/*-------------------------------------------------------------------------------
-    SECTION 16
-    MISSING INDEX IMPACT
+/*-----------------------------------------------------------------------------
+    SECTION 15
+    MISSING INDEX IMPACT ON CPU
 -------------------------------------------------------------------------------
-
 .PURPOSE
+    Identify missing indexes driving unnecessary table scans and CPU cycles.
+-----------------------------------------------------------------------------*/
 
-    Identify missing indexes contributing to CPU overhead.
-
-.WHY THIS MATTERS
-
-    Missing indexes force SQL Server to perform more reads,
-    resulting in higher CPU utilization.
-
-.HEALTHY
-
-    Few high-impact missing index recommendations.
-
-.WARNING
-
-    High user seeks and impact percentages.
-
-.POSSIBLE CAUSES
-
-    Untuned workload.
-    New application functionality.
-
-.NEXT ACTIONS
-
-    Review index recommendations carefully.
-
--------------------------------------------------------------------------------*/
-
-SELECT
-    migs.avg_user_impact,
-    migs.user_seeks,
-    mid.statement,
-    mid.equality_columns,
-    mid.inequality_columns,
-    mid.included_columns
+SELECT TOP (15)
+    CAST(migs.avg_user_impact AS DECIMAL(5,2)) AS AvgUserImpactPct,
+    migs.user_seeks AS UserSeeks,
+    migs.user_scans AS UserScans,
+    DB_NAME(mid.database_id) AS DatabaseName,
+    mid.statement AS TableName,
+    mid.equality_columns AS EqualityColumns,
+    mid.inequality_columns AS InequalityColumns,
+    mid.included_columns AS IncludedColumns
 FROM sys.dm_db_missing_index_details mid
-JOIN sys.dm_db_missing_index_groups mig
+INNER JOIN sys.dm_db_missing_index_groups mig
     ON mid.index_handle = mig.index_handle
-JOIN sys.dm_db_missing_index_group_stats migs
+INNER JOIN sys.dm_db_missing_index_group_stats migs
     ON mig.index_group_handle = migs.group_handle
-ORDER BY migs.avg_user_impact DESC;
-
+ORDER BY (migs.avg_user_impact * migs.user_seeks) DESC;
 GO
 
-/*-------------------------------------------------------------------------------
-    SECTION 17
-    CPU WAIT STATISTICS
+/*-----------------------------------------------------------------------------
+    SECTION 16
+    CPU-RELATED FILTERED WAIT STATISTICS
 -------------------------------------------------------------------------------
-
 .PURPOSE
+    Inspect top actionable waits affecting CPU performance.
+-----------------------------------------------------------------------------*/
 
-    Review the top waits affecting CPU-related performance.
-
-.WHY THIS MATTERS
-
-    High CPU is frequently a symptom rather than the root cause.
-
-.HEALTHY
-
-    Waits align with workload characteristics.
-
-.WARNING
-
-    CPU-related waits dominate the system.
-
-.POSSIBLE CAUSES
-
-    CPU pressure.
-    Parallelism.
-    Excessive workload volume.
-
-.NEXT ACTIONS
-
-    Review wait categories and correlate with workload patterns.
-
--------------------------------------------------------------------------------*/
-
-SELECT TOP (25)
+SELECT TOP (15)
     wait_type,
+    waiting_tasks_count,
     wait_time_ms,
     signal_wait_time_ms,
-    waiting_tasks_count
+    max_wait_time_ms,
+    CAST(wait_time_ms AS FLOAT) / NULLIF(waiting_tasks_count, 0) AS AvgWaitTimeMs
 FROM sys.dm_os_wait_stats
-WHERE wait_type NOT LIKE 'SLEEP%'
+WHERE wait_type NOT IN
+(
+    N'BROKER_EVENTHANDLER', N'BROKER_RECEIVE_WAITFOR', N'BROKER_TASK_STOP', N'BROKER_TO_FLUSH',
+    N'BROKER_TRANSMITTER', N'CHECKPOINT_QUEUE', N'CHKPT', N'CLR_AUTO_EVENT', N'CLR_MANUAL_EVENT',
+    N'CLR_SEMAPHORE', N'CXCONSUMER', N'DIRTY_PAGE_POLL', N'DISPATCHER_QUEUE_SEMAPHORE',
+    N'FT_IFTS_SCHEDULER_IDLE_WAIT', N'HADR_FILESTREAM_IOMGR_IOCOMPLETION', N'LAZYWRITER_SLEEP',
+    N'LOGMGR_QUEUE', N'MEMORY_ALLOCATION_EXT', N'ONDEMAND_TASK_QUEUE', N'REQUEST_FOR_DEADLOCK_SEARCH',
+    N'RESOURCE_QUEUE', N'SERVER_IDLE_CHECK', N'SLEEP_TASK', N'SLEEP_SYSTEMTASK', N'XE_DISPATCHER_WAIT',
+    N'XE_TIMER_EVENT'
+)
+  AND wait_type NOT LIKE N'SLEEP_%'
+  AND wait_type NOT LIKE N'PREEMPTIVE_%'
 ORDER BY wait_time_ms DESC;
-
 GO
 
-/*-------------------------------------------------------------------------------
-    SECTION 18
+/*-----------------------------------------------------------------------------
+    SECTION 17
     EXECUTIVE SUMMARY
 -------------------------------------------------------------------------------
-
 .PURPOSE
-
-    Provide a quick CPU health assessment.
-
-.HEALTHY ENVIRONMENT
-
-    Stable SQLProcessUtilization.
-
-    Low runnable queues.
-
-    No scheduler pressure.
-
-    CPU workload evenly distributed.
-
-    No excessive compilations.
-
-.INVESTIGATE
-
-    High CPU utilization.
-
-    High runnable queues.
-
-    High SOS_SCHEDULER_YIELD.
-
-    High CXPACKET/CXCONSUMER.
-
-    High compilations.
-
-.NEXT ACTIONS
-
-    Active CPU:
-        Review Sections 3 and 4.
-
-    Scheduler Pressure:
-        Review Sections 8, 9 and 10.
-
-    Parallelism:
-        Review Sections 12 and 13.
-
-    Plan Cache:
-        Review Sections 14 and 15.
-
--------------------------------------------------------------------------------*/
+    High-level CPU summary dashboard.
+-----------------------------------------------------------------------------*/
 
 SELECT
-    (SELECT COUNT(*)
-     FROM sys.dm_exec_requests
-     WHERE session_id > 50) AS ActiveRequests,
-
-    (SELECT SUM(runnable_tasks_count)
-     FROM sys.dm_os_schedulers
-     WHERE scheduler_id < 255) AS RunnableTasks,
-
-    (SELECT value_in_use
-     FROM sys.configurations
-     WHERE name = 'max degree of parallelism') AS MAXDOP,
-
-    (SELECT value_in_use
-     FROM sys.configurations
-     WHERE name = 'cost threshold for parallelism') AS CostThresholdForParallelism,
-
-    (SELECT COUNT(*)
-     FROM sys.dm_exec_cached_plans
-     WHERE objtype = 'Adhoc') AS AdhocPlans;
-
+    (SELECT COUNT(*) FROM sys.dm_exec_requests WHERE session_id > 50 AND session_id <> @@SPID) AS ActiveRequests,
+    (SELECT SUM(runnable_tasks_count) FROM sys.dm_os_schedulers WHERE scheduler_id < 255 AND status = 'VISIBLE ONLINE') AS RunnableTasks,
+    (SELECT value_in_use FROM sys.configurations WHERE name = 'max degree of parallelism') AS MAXDOP,
+    (SELECT value_in_use FROM sys.configurations WHERE name = 'cost threshold for parallelism') AS CostThresholdForParallelism,
+    (SELECT COUNT(*) FROM sys.dm_exec_cached_plans WHERE objtype = 'Adhoc' AND usecounts = 1) AS SingleUseAdhocPlans;
 GO
-
 
 /******************************************************************************
 FINAL DBA TRIAGE MATRIX
-*******************************************************************************
+-------------------------------------------------------------------------------
+CPU BOTTLENECK SYMPTOM              ACTIONABLE NEXT STEP
+-------------------------------------------------------------------------------
+High RunnableTasks / SOS_SCHEDULER  --> Tune top queries (Section 4) & Missing Indexes (Section 15)
+High CXPACKET with low CXCONSUMER   --> Evaluate MAXDOP / Cost Threshold (Section 11)
+High Compilations / Adhoc bloat     --> Enable 'optimize for ad hoc workloads'
+High SystemIdle, Low SQL Usage      --> Investigate external OS processes
+******************************************************************************/
 
-CPU SATURATION
-
-INDICATORS
-
-    High SQLProcessUtilization
-
-    High RunnableTasks
-
-    High SOS_SCHEDULER_YIELD
-
-REVIEW
-
-    Sections 3, 4, 8, 9 and 10
-
-------------------------------------------------------------------------------
-PARALLELISM ISSUE
-
-INDICATORS
-
-    CXPACKET
-
-    CXCONSUMER
-
-    High CPU
-
-REVIEW
-
-    Sections 12 and 13
-
-------------------------------------------------------------------------------
-COMPILATION ISSUE
-
-INDICATORS
-
-    High SQL Compilations/sec
-
-    High SQL Re-Compilations/sec
-
-    Large Adhoc Cache
-
-REVIEW
-
-    Sections 14 and 15
-
-------------------------------------------------------------------------------
 QUERY TUNING ISSUE
 
 INDICATORS

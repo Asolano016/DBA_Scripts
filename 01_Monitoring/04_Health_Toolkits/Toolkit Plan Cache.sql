@@ -1,302 +1,332 @@
 /******************************************************************************
 SQL SERVER PLAN CACHE HEALTH CHECK & TROUBLESHOOTING GUIDE
 -------------------------------------------------------------------------------
-
 PURPOSE
 
-This toolkit helps identify:
+This toolkit provides a structured approach for investigating SQL Server Plan Cache
+memory consumption, single-use ad-hoc plan bloat, procedure cache efficiency,
+plan recompilations, and cache store memory distribution.
 
-1. Plan cache memory consumption
-2. Adhoc plan cache pollution
-3. Single-use plans
-4. Stored procedure cache efficiency
-5. Recompile activity
-6. Large execution plans
-7. Frequently executed plans
-8. Expensive cached queries
-9. Plan cache fragmentation patterns
-10. Overall plan cache health
+TARGET COMPATIBILITY
+    SQL Server 2019 and later (Enterprise, Standard, Developer)
+
+SAFETY & PERMISSIONS
+    Read-Only diagnostic script.
+    Requires: VIEW SERVER STATE (SQL 2019) / VIEW SERVER PERFORMANCE STATE (SQL 2022)
+
+AREAS COVERED
+
+1. Plan Cache Memory Distribution by Object Type
+2. Ad-Hoc Plan Cache Bloat & Single-Use Plans
+3. Top Single-Use Ad-Hoc Statements Consuming Cache
+4. Largest Individual Cached Plans in Memory
+5. Most Frequently Executed Cached Statements
+6. Top CPU Consuming Cached Statements
+7. Stored Procedure Cache Utilization
+8. Stored Procedures by Execution & Recompile Indicators
+9. Plan Cache Reuse Distribution (Use Count Buckets)
+10. Memory Cache Store Counters & Clerks
+11. Plan Cache Hit Ratio (Normalized Calculation)
+12. Expensive Cached Plans (Safe XML Retrieval)
+13. Executive Summary & Plan Cache Triage Matrix
 
 RECOMMENDED TROUBLESHOOTING FLOW
 
-    1. Executive Summary
-    2. Plan Cache Memory Distribution
-    3. Adhoc Plan Analysis
-    4. Single-Use Plans
-    5. Largest Cached Plans
-    6. Most Executed Cached Plans
-    7. Most Expensive Cached Plans
-    8. Procedure Cache Analysis
-    9. Recompile Activity
-    10. Plan Reuse Analysis
-    11. Cache Stores
-    12. Memory Clerks
-    13. Cache Hit Ratios
-    14. Triage Indicators
+    1. Review Executive Summary & Plan Cache Distribution
+    2. Check Single-Use Ad-Hoc Plan Bloat (Section 2 & 3)
+    3. Check Procedure Cache Efficiency & Recompiles (Section 7 & 8)
+    4. Review Memory Cache Stores & Recommendations
 
 ******************************************************************************/
 
---------------------------------------------------------------------------------
--- SECTION 1
--- EXECUTIVE SUMMARY
---------------------------------------------------------------------------------
---
--- PURPOSE
---
---     Quick plan cache health overview.
---
--- HEALTHY
---
---     Low Adhoc percentage.
---     High plan reuse.
---     Limited single-use plans.
---
--- INVESTIGATE
---
---     Excessive Adhoc plans.
---     Large cache usage.
---     Many single-use plans.
---
---------------------------------------------------------------------------------
+/*-----------------------------------------------------------------------------
+    SECTION 1
+    PLAN CACHE MEMORY DISTRIBUTION BY OBJECT TYPE
+-------------------------------------------------------------------------------
+.PURPOSE
+    Understand how execution plan cache memory is divided across object types.
+-----------------------------------------------------------------------------*/
 
 SELECT
-
-    GETDATE() AS CaptureTime,
-
-    (SELECT COUNT(*)
-     FROM sys.dm_exec_cached_plans) AS TotalPlans,
-
-    (SELECT COUNT(*)
-     FROM sys.dm_exec_cached_plans
-     WHERE objtype = 'Adhoc') AS AdhocPlans,
-
-    (SELECT COUNT(*)
-     FROM sys.dm_exec_cached_plans
-     WHERE usecounts = 1) AS SingleUsePlans,
-
-    (SELECT SUM(size_in_bytes)/1024/1024
-     FROM sys.dm_exec_cached_plans) AS TotalCacheMB;
-
-GO
-
---------------------------------------------------------------------------------
--- SECTION 2
--- PLAN CACHE MEMORY DISTRIBUTION
---------------------------------------------------------------------------------
---
--- PURPOSE
---
---     Understand cache memory consumption by object type.
---
---------------------------------------------------------------------------------
-
-SELECT
-
-    objtype,
-
-    COUNT(*) AS Plans,
-
-    SUM(size_in_bytes)/1024/1024 AS CacheMB
-
+    objtype AS ObjectType,
+    COUNT(*) AS PlanCount,
+    SUM(CAST(size_in_bytes AS BIGINT)) / 1024 / 1024 AS CacheSizeMB,
+    SUM(CASE WHEN usecounts = 1 THEN 1 ELSE 0 END) AS SingleUsePlans,
+    SUM(CASE WHEN usecounts = 1 THEN CAST(size_in_bytes AS BIGINT) ELSE 0 END) / 1024 / 1024 AS SingleUseCacheMB
 FROM sys.dm_exec_cached_plans
-
 GROUP BY objtype
-
-ORDER BY CacheMB DESC;
-
+ORDER BY CacheSizeMB DESC;
 GO
 
---------------------------------------------------------------------------------
--- SECTION 3
--- ADHOC PLAN ANALYSIS
---------------------------------------------------------------------------------
---
--- PURPOSE
---
---     Identify Adhoc cache pollution.
---
--- WHY THIS MATTERS
---
---     Excessive Adhoc plans:
---
---         Waste memory
---         Increase compilation overhead
---         Reduce cache efficiency
---
---------------------------------------------------------------------------------
+/*-----------------------------------------------------------------------------
+    SECTION 2
+    AD-HOC PLAN CACHE BLOAT & SINGLE-USE PLANS
+-------------------------------------------------------------------------------
+.PURPOSE
+    Measure memory wasted by unparameterized single-use ad-hoc queries.
+-----------------------------------------------------------------------------*/
 
 SELECT
-
-    COUNT(*) AS AdhocPlans,
-
-    SUM(size_in_bytes)/1024/1024 AS AdhocCacheMB
-
+    COUNT(*) AS TotalAdhocPlans,
+    SUM(CAST(size_in_bytes AS BIGINT)) / 1024 / 1024 AS TotalAdhocCacheMB,
+    SUM(CASE WHEN usecounts = 1 THEN 1 ELSE 0 END) AS SingleUseAdhocPlans,
+    SUM(CASE WHEN usecounts = 1 THEN CAST(size_in_bytes AS BIGINT) ELSE 0 END) / 1024 / 1024 AS SingleUseAdhocMB,
+    CAST(SUM(CASE WHEN usecounts = 1 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0) AS DECIMAL(5,2)) AS SingleUsePercentage
 FROM sys.dm_exec_cached_plans
-
 WHERE objtype = 'Adhoc';
-
 GO
 
---------------------------------------------------------------------------------
--- SECTION 4
--- SINGLE-USE PLAN ANALYSIS
---------------------------------------------------------------------------------
---
--- PURPOSE
---
---     Identify plans compiled once and never reused.
---
--- WARNING
---
---     High counts may indicate
---     poor parameterization.
---
---------------------------------------------------------------------------------
+/*-----------------------------------------------------------------------------
+    SECTION 3
+    TOP SINGLE-USE AD-HOC STATEMENTS CONSUMING CACHE
+-------------------------------------------------------------------------------
+.PURPOSE
+    Identify the largest single-use ad-hoc query plans polluting the cache.
+-----------------------------------------------------------------------------*/
 
-SELECT
-
-    COUNT(*) AS SingleUsePlans,
-
-    SUM(size_in_bytes)/1024/1024 AS SingleUseCacheMB
-
-FROM sys.dm_exec_cached_plans
-
-WHERE usecounts = 1;
-
-GO
-
---------------------------------------------------------------------------------
--- SECTION 5
--- LARGEST CACHED PLANS
---------------------------------------------------------------------------------
---
--- PURPOSE
---
---     Identify plans consuming the most memory.
---
---------------------------------------------------------------------------------
-
-SELECT TOP 25
-
-    cp.usecounts,
-
-    cp.objtype,
-
-    cp.size_in_bytes / 1024 AS PlanKB,
-
-    st.text
-
+SELECT TOP (25)
+    cp.size_in_bytes / 1024 AS PlanSizeKB,
+    cp.usecounts AS UseCount,
+    cp.cacheobjtype AS CacheObjectType,
+    st.text AS StatementText
 FROM sys.dm_exec_cached_plans cp
-
 CROSS APPLY sys.dm_exec_sql_text(cp.plan_handle) st
-
+WHERE cp.objtype = 'Adhoc'
+  AND cp.usecounts = 1
 ORDER BY cp.size_in_bytes DESC;
-
 GO
 
---------------------------------------------------------------------------------
--- SECTION 6
--- MOST EXECUTED CACHED QUERIES
---------------------------------------------------------------------------------
---
--- PURPOSE
---
---     Identify heavily reused plans.
---
---------------------------------------------------------------------------------
+/*-----------------------------------------------------------------------------
+    SECTION 4
+    LARGEST INDIVIDUAL CACHED PLANS IN MEMORY
+-------------------------------------------------------------------------------
+.PURPOSE
+    Identify individual execution plans consuming the most memory in cache.
+-----------------------------------------------------------------------------*/
 
-SELECT TOP 25
-
-    qs.execution_count,
-
-    qs.last_execution_time,
-
-    st.text
-
-FROM sys.dm_exec_query_stats qs
-
-CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
-
-ORDER BY qs.execution_count DESC;
-
+SELECT TOP (25)
+    cp.objtype AS ObjectType,
+    cp.usecounts AS UseCount,
+    cp.size_in_bytes / 1024 AS PlanSizeKB,
+    st.text AS BatchText
+FROM sys.dm_exec_cached_plans cp
+CROSS APPLY sys.dm_exec_sql_text(cp.plan_handle) st
+ORDER BY cp.size_in_bytes DESC;
 GO
 
---------------------------------------------------------------------------------
--- SECTION 7
--- MOST EXPENSIVE CACHED QUERIES
---------------------------------------------------------------------------------
---
--- PURPOSE
---
---     Identify cached plans contributing most workload.
---
---------------------------------------------------------------------------------
+/*-----------------------------------------------------------------------------
+    SECTION 5
+    MOST FREQUENTLY EXECUTED CACHED STATEMENTS
+-------------------------------------------------------------------------------
+.PURPOSE
+    Identify high-frequency queries benefiting from plan reuse.
+-----------------------------------------------------------------------------*/
 
-SELECT TOP 25
-
-    qs.execution_count,
-
+SELECT TOP (25)
+    qs.execution_count AS ExecutionCount,
+    qs.last_execution_time AS LastExecutionTime,
     qs.total_worker_time / 1000 AS TotalCPUms,
-
-    qs.total_elapsed_time / 1000 AS TotalDurationMS,
-
-    qs.total_logical_reads,
-
-    st.text
-
+    (qs.total_worker_time / NULLIF(qs.execution_count, 0)) / 1000.0 AS AvgCPUms,
+    SUBSTRING(
+        st.text,
+        (qs.statement_start_offset / 2) + 1,
+        ((CASE qs.statement_end_offset
+            WHEN -1 THEN DATALENGTH(st.text)
+            ELSE qs.statement_end_offset
+         END - qs.statement_start_offset) / 2) + 1
+    ) AS StatementText
 FROM sys.dm_exec_query_stats qs
-
 CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
-
-ORDER BY qs.total_worker_time DESC;
-
+ORDER BY qs.execution_count DESC;
 GO
 
---------------------------------------------------------------------------------
--- SECTION 8
--- PROCEDURE CACHE ANALYSIS
---------------------------------------------------------------------------------
---
--- PURPOSE
---
---     Review procedure cache utilization.
---
---------------------------------------------------------------------------------
+/*-----------------------------------------------------------------------------
+    SECTION 6
+    TOP CPU CONSUMING CACHED STATEMENTS
+-------------------------------------------------------------------------------
+.PURPOSE
+    Identify cached statements responsible for the highest cumulative CPU usage.
+-----------------------------------------------------------------------------*/
+
+SELECT TOP (25)
+    qs.execution_count AS ExecutionCount,
+    qs.total_worker_time / 1000 AS TotalCPUms,
+    (qs.total_worker_time / NULLIF(qs.execution_count, 0)) / 1000.0 AS AvgCPUms,
+    qs.total_elapsed_time / 1000 AS TotalDurationMs,
+    qs.total_logical_reads AS TotalLogicalReads,
+    SUBSTRING(
+        st.text,
+        (qs.statement_start_offset / 2) + 1,
+        ((CASE qs.statement_end_offset
+            WHEN -1 THEN DATALENGTH(st.text)
+            ELSE qs.statement_end_offset
+         END - qs.statement_start_offset) / 2) + 1
+    ) AS StatementText
+FROM sys.dm_exec_query_stats qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+ORDER BY qs.total_worker_time DESC;
+GO
+
+/*-----------------------------------------------------------------------------
+    SECTION 7
+    STORED PROCEDURE CACHE UTILIZATION
+-------------------------------------------------------------------------------
+.PURPOSE
+    Analyze procedure cache footprint compared to prepared plans.
+-----------------------------------------------------------------------------*/
 
 SELECT
-
-    objtype,
-
-    COUNT(*) AS Plans,
-
-    SUM(size_in_bytes)/1024/1024 AS CacheMB
-
+    objtype AS ObjectType,
+    COUNT(*) AS PlanCount,
+    SUM(CAST(size_in_bytes AS BIGINT)) / 1024 / 1024 AS CacheSizeMB,
+    AVG(usecounts) AS AvgUseCount
 FROM sys.dm_exec_cached_plans
-
-WHERE objtype IN
-(
-    'Proc',
-    'Prepared'
-)
-
+WHERE objtype IN ('Proc', 'Prepared')
 GROUP BY objtype
-
-ORDER BY CacheMB DESC;
-
+ORDER BY CacheSizeMB DESC;
 GO
 
---------------------------------------------------------------------------------
--- SECTION 9
--- RECOMPILE ANALYSIS
---------------------------------------------------------------------------------
---
--- PURPOSE
---
---     Identify procedures experiencing recompiles.
---
---------------------------------------------------------------------------------
+/*-----------------------------------------------------------------------------
+    SECTION 8
+    STORED PROCEDURES BY EXECUTION & RECOMPILE INDICATORS
+-------------------------------------------------------------------------------
+.PURPOSE
+    Review procedure stats and identify frequently recompiled or newly cached routines.
+-----------------------------------------------------------------------------*/
 
-SELECT TOP 50
+SELECT TOP (25)
+    DB_NAME(database_id) AS DatabaseName,
+    OBJECT_NAME(object_id, database_id) AS ProcedureName,
+    cached_time AS CachedTime,
+    last_execution_time AS LastExecutionTime,
+    execution_count AS ExecutionCount,
+    total_worker_time / 1000 AS TotalCPUms,
+    (total_worker_time / NULLIF(execution_count, 0)) / 1000.0 AS AvgCPUms
+FROM sys.dm_exec_procedure_stats
+ORDER BY cached_time DESC;
+GO
+
+/*-----------------------------------------------------------------------------
+    SECTION 9
+    PLAN CACHE REUSE DISTRIBUTION (USE COUNT BUCKETS)
+-------------------------------------------------------------------------------
+.PURPOSE
+    Evaluate overall plan reuse efficiency across execution count buckets.
+-----------------------------------------------------------------------------*/
+
+SELECT
+    CASE
+        WHEN usecounts = 1 THEN '1 Execution (Single-Use)'
+        WHEN usecounts BETWEEN 2 AND 10 THEN '2 - 10 Executions'
+        WHEN usecounts BETWEEN 11 AND 100 THEN '11 - 100 Executions'
+        WHEN usecounts BETWEEN 101 AND 1000 THEN '101 - 1,000 Executions'
+        ELSE '> 1,000 Executions'
+    END AS ReuseBucket,
+    COUNT(*) AS PlanCount,
+    SUM(CAST(size_in_bytes AS BIGINT)) / 1024 / 1024 AS TotalCacheMB
+FROM sys.dm_exec_cached_plans
+GROUP BY
+    CASE
+        WHEN usecounts = 1 THEN '1 Execution (Single-Use)'
+        WHEN usecounts BETWEEN 2 AND 10 THEN '2 - 10 Executions'
+        WHEN usecounts BETWEEN 11 AND 100 THEN '11 - 100 Executions'
+        WHEN usecounts BETWEEN 101 AND 1000 THEN '101 - 1,000 Executions'
+        ELSE '> 1,000 Executions'
+    END
+ORDER BY MIN(usecounts) ASC;
+GO
+
+/*-----------------------------------------------------------------------------
+    SECTION 10
+    MEMORY CACHE STORE COUNTERS & CLERKS
+-------------------------------------------------------------------------------
+.PURPOSE
+    Inspect memory consumed across SQLCP (Adhoc/Prepared) and OBJCP (Procedures).
+-----------------------------------------------------------------------------*/
+
+SELECT
+    type AS ClerkType,
+    pages_kb / 1024 AS MemoryMB,
+    entries_count AS EntriesCount
+FROM sys.dm_os_memory_cache_counters
+WHERE type IN ('CACHESTORE_SQLCP', 'CACHESTORE_OBJCP', 'CACHESTORE_PHDR')
+ORDER BY MemoryMB DESC;
+GO
+
+/*-----------------------------------------------------------------------------
+    SECTION 11
+    PLAN CACHE HIT RATIO (NORMALIZED CALCULATION)
+-------------------------------------------------------------------------------
+.PURPOSE
+    Calculate true Plan Cache Hit Ratio by normalizing against Cache Hit Ratio Base.
+-----------------------------------------------------------------------------*/
+
+SELECT
+    r.instance_name AS CacheStoreName,
+    CAST(100.0 * r.cntr_value / NULLIF(b.cntr_value, 0) AS DECIMAL(5,2)) AS CacheHitRatioPercentage
+FROM sys.dm_os_performance_counters r
+INNER JOIN sys.dm_os_performance_counters b
+    ON r.instance_name = b.instance_name
+    AND b.counter_name = 'Cache Hit Ratio Base'
+    AND b.object_name LIKE '%Plan Cache%'
+WHERE r.counter_name = 'Cache Hit Ratio'
+  AND r.object_name LIKE '%Plan Cache%';
+GO
+
+/*-----------------------------------------------------------------------------
+    SECTION 12
+    EXPENSIVE CACHED PLANS (SAFE XML RETRIEVAL)
+-------------------------------------------------------------------------------
+.PURPOSE
+    Safely retrieve execution plans for top 5 CPU consuming cached queries.
+-----------------------------------------------------------------------------*/
+
+SELECT TOP (5)
+    qs.total_worker_time / 1000 AS TotalCPUms,
+    qs.execution_count AS ExecutionCount,
+    SUBSTRING(
+        st.text,
+        (qs.statement_start_offset / 2) + 1,
+        ((CASE qs.statement_end_offset
+            WHEN -1 THEN DATALENGTH(st.text)
+            ELSE qs.statement_end_offset
+         END - qs.statement_start_offset) / 2) + 1
+    ) AS StatementText,
+    qp.query_plan
+FROM sys.dm_exec_query_stats qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+OUTER APPLY sys.dm_exec_query_plan(qs.plan_handle) qp
+ORDER BY qs.total_worker_time DESC
+OPTION (MAXDOP 1);
+GO
+
+/*-----------------------------------------------------------------------------
+    SECTION 13
+    EXECUTIVE SUMMARY
+-------------------------------------------------------------------------------
+.PURPOSE
+    High-level Plan Cache health dashboard.
+-----------------------------------------------------------------------------*/
+
+SELECT
+    (SELECT COUNT(*) FROM sys.dm_exec_cached_plans) AS TotalCachedPlans,
+    (SELECT SUM(CAST(size_in_bytes AS BIGINT)) / 1024 / 1024 FROM sys.dm_exec_cached_plans) AS TotalCacheMB,
+    (SELECT COUNT(*) FROM sys.dm_exec_cached_plans WHERE objtype = 'Adhoc' AND usecounts = 1) AS SingleUseAdhocPlans,
+    (SELECT SUM(CAST(size_in_bytes AS BIGINT)) / 1024 / 1024 FROM sys.dm_exec_cached_plans WHERE objtype = 'Adhoc' AND usecounts = 1) AS SingleUseAdhocMB,
+    (SELECT value_in_use FROM sys.configurations WHERE name = 'optimize for ad hoc workloads') AS OptimizeForAdHocWorkloadsSetting;
+GO
+
+/******************************************************************************
+FINAL DBA TRIAGE MATRIX
+-------------------------------------------------------------------------------
+PLAN CACHE SYMPTOM                  ACTIONABLE NEXT STEP
+-------------------------------------------------------------------------------
+Single-Use Adhoc Plans > 10,000     --> Enable 'optimize for ad hoc workloads'
+Ad-Hoc Cache MB > Buffer Pool       --> Address unparameterized client application SQL
+Frequent Procedure Recompiles       --> Inspect procedure stats and recompile options
+Low Cache Hit Ratio (<80%)          --> Investigate dynamic SQL strings with literal parameters
+******************************************************************************/
+
 
     DB_NAME(database_id) AS DatabaseName,
 

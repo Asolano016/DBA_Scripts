@@ -1,149 +1,96 @@
 /******************************************************************************
-SQL SERVER IO HEALTH CHECK & TROUBLESHOOTING GUIDE
+SQL SERVER I/O & STORAGE HEALTH CHECK & TROUBLESHOOTING GUIDE
 -------------------------------------------------------------------------------
+PURPOSE
 
-.PURPOSE
+This toolkit provides a structured approach for investigating physical storage
+performance, data and log file latencies, stall times, TempDB I/O bottlenecks,
+and I/O-related wait statistics.
 
-This toolkit provides a structured approach for investigating
-I/O-related performance issues in SQL Server.
+TARGET COMPATIBILITY
+    SQL Server 2019 and later (Enterprise, Standard, Developer)
 
-.AREAS COVERED
+SAFETY & PERMISSIONS
+    Read-Only diagnostic script.
+    Requires: VIEW SERVER STATE (SQL 2019) / VIEW SERVER PERFORMANCE STATE (SQL 2022)
 
-1. File I/O Overview
-2. Data vs Log File Latency
-3. I/O Latency per Database
-4. Top Read Databases
-5. Top Write Databases
-6. Top Read Queries
-7. Top Write Queries
-8. Active I/O Consumers
-9. TempDB I/O Analysis
-10. PAGEIOLATCH Analysis
-11. WRITELOG Analysis
-12. Storage File Analysis
-13. Wait Statistics Review
-14. Executive Summary
+AREAS COVERED
 
-.HOW TO USE
+1. Database File I/O & Stall Time Overview
+2. Data vs Transaction Log Latency by File
+3. Aggregate I/O Latency by Database
+4. Top Read-Intensive Databases
+5. Top Write-Intensive Databases
+6. Top Logical Read Queries (Historical)
+7. Top Logical Write Queries (Historical)
+8. Active I/O Consuming Requests
+9. TempDB File Latency & Stall Analysis
+10. Physical Read Waits (PAGEIOLATCH_*)
+11. Transaction Log Flush Waits (WRITELOG)
+12. Physical File Layout & Growth Configuration
+13. Storage-Related Wait Statistics
+14. Executive Summary & Storage Triage Matrix
 
-Recommended troubleshooting sequence:
+RECOMMENDED TROUBLESHOOTING FLOW
 
-    1. Executive Summary
-    2. File Latency
-    3. Wait Analysis
-    4. TempDB Review
-    5. Active I/O Consumers
-    6. Top Read/Write Queries
+    1. Executive Summary & File Latency
+    2. Data vs Log Latencies (<20ms healthy, >50ms warning, >100ms critical)
+    3. PAGEIOLATCH and WRITELOG Wait Analysis
+    4. Active & Historical I/O Heavy Queries
 
 ******************************************************************************/
 
 /*-----------------------------------------------------------------------------
     SECTION 1
-    FILE I/O OVERVIEW
------------------------------------------------------------------------------
-
+    DATABASE FILE I/O & STALL TIME OVERVIEW
+-------------------------------------------------------------------------------
 .PURPOSE
+    Review overall read/write activity and cumulative stall times across files.
 
-   Review overall read/write activity by database file.
-
-.WHY THIS MATTERS
-
-    Identifies files generating the most I/O activity.
-
-.KEY METRICS
-
-    num_of_reads
-
-    num_of_writes
-
-    io_stall_read_ms
-
-    io_stall_write_ms
-
-.HEALTHY
-
-    Low stall times relative to workload.
-
-.WARNING
-
-    Significant stall times.
-
-.POSSIBLE CAUSES
-
-    Storage bottlenecks.
-    TempDB pressure.
-    Large reporting workloads.
-
-.NEXT ACTIONS
-
-    Review Sections 2, 10 and 11.
-
--------------------------------------------------------------------------------*/
+.NOTE
+    Metrics from sys.dm_io_virtual_file_stats are cumulative since instance startup.
+-----------------------------------------------------------------------------*/
 
 SELECT
     DB_NAME(vfs.database_id) AS DatabaseName,
     mf.name AS LogicalFileName,
-    mf.type_desc,
-    vfs.num_of_reads,
-    vfs.num_of_writes,
-    vfs.io_stall_read_ms,
-    vfs.io_stall_write_ms
-FROM sys.dm_io_virtual_file_stats(NULL,NULL) vfs
+    mf.type_desc AS FileType,
+    mf.physical_name AS PhysicalPath,
+    vfs.num_of_reads AS NumberOfReads,
+    vfs.num_of_writes AS NumberOfWrites,
+    vfs.io_stall_read_ms AS ReadStallMs,
+    vfs.io_stall_write_ms AS WriteStallMs,
+    (vfs.io_stall_read_ms + vfs.io_stall_write_ms) AS TotalStallMs
+FROM sys.dm_io_virtual_file_stats(NULL, NULL) vfs
 INNER JOIN sys.master_files mf
     ON vfs.database_id = mf.database_id
     AND vfs.file_id = mf.file_id
-ORDER BY (vfs.io_stall_read_ms + vfs.io_stall_write_ms) DESC;
+ORDER BY TotalStallMs DESC;
 GO
 
-/*-------------------------------------------------------------------------------
+/*-----------------------------------------------------------------------------
     SECTION 2
-    DATA VS LOG FILE LATENCY
+    DATA VS TRANSACTION LOG LATENCY BY FILE
 -------------------------------------------------------------------------------
-
 .PURPOSE
+    Calculate average read and write latencies per file in milliseconds.
 
-    Compare latency between data and log files.
-
-.WHY THIS MATTERS
-
-    Helps identify where storage problems exist.
-
-.HEALTHY
-
-    Read latency < 20 ms
-
-    Write latency < 20 ms
-
-.WARNING
-
-    Read latency > 20 ms
-
-    Write latency > 20 ms
-
-.CRITICAL
-
-    Latency consistently above 100 ms.
-
-.POSSIBLE CAUSES
-
-    Slow storage.
-    Shared storage contention.
-    SAN issues.
-
-.NEXT ACTIONS
-
-    Review infrastructure.
-    Review WRITELOG waits.
-
--------------------------------------------------------------------------------*/
+.BENCHMARKS
+    < 10-20 ms: Healthy / Standard SSD/SAN
+    20 - 50 ms: Warning (Storage throttling or queueing)
+    > 50 - 100 ms: Critical storage bottleneck
+-----------------------------------------------------------------------------*/
 
 SELECT
     DB_NAME(vfs.database_id) AS DatabaseName,
-    mf.type_desc,
-    CAST(io_stall_read_ms AS FLOAT)/NULLIF(num_of_reads,0) AS AvgReadLatencyMs,
-    CAST(io_stall_write_ms AS FLOAT)/NULLIF(num_of_writes,0) AS AvgWriteLatencyMs
-FROM sys.dm_io_virtual_file_stats(NULL,NULL) vfs
-JOIN sys.master_files mf
+    mf.name AS LogicalFileName,
+    mf.type_desc AS FileType,
+    CAST(vfs.io_stall_read_ms AS FLOAT) / NULLIF(vfs.num_of_reads, 0) AS AvgReadLatencyMs,
+    CAST(vfs.io_stall_write_ms AS FLOAT) / NULLIF(vfs.num_of_writes, 0) AS AvgWriteLatencyMs,
+    vfs.num_of_bytes_read / 1024 / 1024 AS MBRead,
+    vfs.num_of_bytes_written / 1024 / 1024 AS MBWritten
+FROM sys.dm_io_virtual_file_stats(NULL, NULL) vfs
+INNER JOIN sys.master_files mf
     ON vfs.database_id = mf.database_id
     AND vfs.file_id = mf.file_id
 ORDER BY AvgReadLatencyMs DESC;
@@ -151,495 +98,278 @@ GO
 
 /*-----------------------------------------------------------------------------
     SECTION 3
-    I/O LATENCY BY DATABASE
+    AGGREGATE I/O LATENCY BY DATABASE
 -------------------------------------------------------------------------------
-
 .PURPOSE
-
-    Identify databases generating highest storage latency.
-
-.WHY THIS MATTERS
-
-    Helps quickly narrow investigation scope.
-
-.HEALTHY
-
-    Similar latency across databases.
-
-.WARNING
-
-    One database dominates latency metrics.
-
-.NEXT ACTIONS
-
-    Review workload within affected database.
-
--------------------------------------------------------------------------------*/
+    Identify databases generating the highest aggregate storage latency.
+-----------------------------------------------------------------------------*/
 
 SELECT
     DB_NAME(database_id) AS DatabaseName,
     SUM(io_stall_read_ms) AS TotalReadStallMs,
-    SUM(io_stall_write_ms) AS TotalWriteStallMs
-FROM sys.dm_io_virtual_file_stats(NULL,NULL)
+    SUM(io_stall_write_ms) AS TotalWriteStallMs,
+    SUM(io_stall_read_ms + io_stall_write_ms) AS TotalStallMs,
+    SUM(num_of_bytes_read) / 1024 / 1024 AS TotalMBRead,
+    SUM(num_of_bytes_written) / 1024 / 1024 AS TotalMBWritten
+FROM sys.dm_io_virtual_file_stats(NULL, NULL)
 GROUP BY database_id
-ORDER BY (SUM(io_stall_read_ms)+SUM(io_stall_write_ms)) DESC;
+ORDER BY TotalStallMs DESC;
 GO
 
 /*-----------------------------------------------------------------------------
     SECTION 4
-    TOP READ DATABASES
------------------------------------------------------------------------------
-
+    TOP READ-INTENSIVE DATABASES
+-------------------------------------------------------------------------------
 .PURPOSE
-
-   Identify databases responsible for most physical reads.
-
-.WARNING
-
-    Large read volume from a single database.
-
-.POSSIBLE CAUSES
-
-    Reporting.
-    Missing indexes.
-    Large scans.
-
-.NEXT ACTIONS
-
-    Review Section 6.
-
--------------------------------------------------------------------------------*/
+    Identify databases responsible for the highest physical read volume.
+-----------------------------------------------------------------------------*/
 
 SELECT
     DB_NAME(database_id) AS DatabaseName,
-    SUM(num_of_reads) AS TotalReads
-FROM sys.dm_io_virtual_file_stats(NULL,NULL)
+    SUM(num_of_reads) AS TotalPhysicalReads,
+    SUM(num_of_bytes_read) / 1024 / 1024 AS TotalMBRead
+FROM sys.dm_io_virtual_file_stats(NULL, NULL)
 GROUP BY database_id
-ORDER BY TotalReads DESC;
+ORDER BY TotalPhysicalReads DESC;
 GO
 
 /*-----------------------------------------------------------------------------
     SECTION 5
-    TOP WRITE DATABASES
------------------------------------------------------------------------------
-
+    TOP WRITE-INTENSIVE DATABASES
+-------------------------------------------------------------------------------
 .PURPOSE
-
-    Identify databases responsible for most writes.
-
-.WARNING
-
-    Excessive write activity.
-
-.POSSIBLE CAUSES
-
-    ETL.
-    Bulk loads.
-    Index maintenance.
-
-.NEXT ACTIONS
-
-    Review transaction log activity.
-
--------------------------------------------------------------------------------*/
+    Identify databases responsible for the highest physical write activity.
+-----------------------------------------------------------------------------*/
 
 SELECT
     DB_NAME(database_id) AS DatabaseName,
-    SUM(num_of_writes) AS TotalWrites
-FROM sys.dm_io_virtual_file_stats(NULL,NULL)
+    SUM(num_of_writes) AS TotalPhysicalWrites,
+    SUM(num_of_bytes_written) / 1024 / 1024 AS TotalMBWritten
+FROM sys.dm_io_virtual_file_stats(NULL, NULL)
 GROUP BY database_id
-ORDER BY TotalWrites DESC;
-
+ORDER BY TotalPhysicalWrites DESC;
 GO
 
-/*-------------------------------------------------------------------------------
+/*-----------------------------------------------------------------------------
     SECTION 6
-    TOP READ QUERIES
+    TOP LOGICAL READ QUERIES (HISTORICAL)
 -------------------------------------------------------------------------------
-
 .PURPOSE
+    Identify queries generating the highest logical reads driving I/O and cache churn.
+-----------------------------------------------------------------------------*/
 
-    Identify queries generating highest logical reads.
-
-.WHY THIS MATTERS
-
-    Large read workloads increase I/O pressure.
-
-.WARNING
-
-    Queries with excessive logical reads.
-
-.POSSIBLE CAUSES
-
-    Missing indexes.
-    Scans.
-    Poor filtering.
-
-.NEXT ACTIONS
-
-    Review execution plans.
-
--------------------------------------------------------------------------------*/
-
-SELECT TOP 20
+SELECT TOP (20)
     qs.execution_count,
-    qs.total_logical_reads,
-    qs.total_logical_reads / qs.execution_count AS AvgReads,
-    SUBSTRING(st.text,
-              (qs.statement_start_offset/2)+1,
-              ((CASE qs.statement_end_offset
-                    WHEN -1 THEN DATALENGTH(st.text)
-                    ELSE qs.statement_end_offset
-                END - qs.statement_start_offset)/2)+1) AS QueryText
+    qs.total_logical_reads AS TotalLogicalReads,
+    (qs.total_logical_reads / NULLIF(qs.execution_count, 0)) AS AvgLogicalReads,
+    qs.total_worker_time / 1000 AS TotalCPUms,
+    qs.last_execution_time,
+    SUBSTRING(
+        st.text,
+        (qs.statement_start_offset / 2) + 1,
+        ((CASE qs.statement_end_offset
+            WHEN -1 THEN DATALENGTH(st.text)
+            ELSE qs.statement_end_offset
+         END - qs.statement_start_offset) / 2) + 1
+    ) AS StatementText
 FROM sys.dm_exec_query_stats qs
 CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
 ORDER BY qs.total_logical_reads DESC;
-
 GO
 
-/*-------------------------------------------------------------------------------
+/*-----------------------------------------------------------------------------
     SECTION 7
-    TOP WRITE QUERIES
+    TOP LOGICAL WRITE QUERIES (HISTORICAL)
 -------------------------------------------------------------------------------
-
 .PURPOSE
+    Identify queries driving the highest logical write activity.
+-----------------------------------------------------------------------------*/
 
-    Identify queries generating highest write activity.
-
-.WARNING
-
-    High write workloads.
-
-.POSSIBLE CAUSES
-
-    Batch updates.
-    ETL processes.
-    Index maintenance.
-
-.NEXT ACTIONS
-
-    Review write-heavy workloads.
-
--------------------------------------------------------------------------------*/
-
-SELECT TOP 20
+SELECT TOP (20)
     qs.execution_count,
-    qs.total_logical_writes,
-    qs.total_logical_writes / qs.execution_count AS AvgWrites,
-    SUBSTRING(st.text,
-              (qs.statement_start_offset/2)+1,
-              ((CASE qs.statement_end_offset
-                    WHEN -1 THEN DATALENGTH(st.text)
-                    ELSE qs.statement_end_offset
-                END - qs.statement_start_offset)/2)+1) AS QueryText
+    qs.total_logical_writes AS TotalLogicalWrites,
+    (qs.total_logical_writes / NULLIF(qs.execution_count, 0)) AS AvgLogicalWrites,
+    qs.total_worker_time / 1000 AS TotalCPUms,
+    qs.last_execution_time,
+    SUBSTRING(
+        st.text,
+        (qs.statement_start_offset / 2) + 1,
+        ((CASE qs.statement_end_offset
+            WHEN -1 THEN DATALENGTH(st.text)
+            ELSE qs.statement_end_offset
+         END - qs.statement_start_offset) / 2) + 1
+    ) AS StatementText
 FROM sys.dm_exec_query_stats qs
 CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
 ORDER BY qs.total_logical_writes DESC;
-
 GO
 
-/*-------------------------------------------------------------------------------
+/*-----------------------------------------------------------------------------
     SECTION 8
-    ACTIVE I/O CONSUMERS
+    ACTIVE I/O CONSUMING REQUESTS
 -------------------------------------------------------------------------------
-
 .PURPOSE
-
-    Show active requests performing significant reads or writes.
-
-.WARNING
-
-    High reads/writes by active sessions.
-
-.NEXT ACTIONS
-
-    Capture execution plans.
-
--------------------------------------------------------------------------------*/
+    Show active requests currently performing heavy logical or physical I/O.
+-----------------------------------------------------------------------------*/
 
 SELECT
-    session_id,
-    reads,
-    writes,
-    logical_reads,
-    status,
-    command,
-    DB_NAME(database_id) AS DatabaseName
-FROM sys.dm_exec_requests
-WHERE session_id > 50
-ORDER BY logical_reads DESC;
-
+    r.session_id,
+    r.status,
+    r.reads AS PhysicalReads,
+    r.logical_reads AS LogicalReads,
+    r.writes AS PhysicalWrites,
+    r.total_elapsed_time AS ElapsedTimeMs,
+    r.wait_type,
+    r.wait_time AS WaitTimeMs,
+    DB_NAME(r.database_id) AS DatabaseName,
+    SUBSTRING(
+        st.text,
+        (r.statement_start_offset / 2) + 1,
+        ((CASE r.statement_end_offset
+            WHEN -1 THEN DATALENGTH(st.text)
+            ELSE r.statement_end_offset
+         END - r.statement_start_offset) / 2) + 1
+    ) AS StatementText
+FROM sys.dm_exec_requests r
+CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) st
+WHERE r.session_id > 50
+  AND r.session_id <> @@SPID
+ORDER BY r.logical_reads DESC;
 GO
 
 /*-----------------------------------------------------------------------------
     SECTION 9
-    TEMPDB I/O ANALYSIS
+    TEMPDB FILE LATENCY & STALL ANALYSIS
 -------------------------------------------------------------------------------
-
 .PURPOSE
-
-    Determine TempDB I/O pressure.
-
-.WHY THIS MATTERS
-
-    TempDB is a frequent source of storage bottlenecks.
-
-.WARNING
-
-    TempDB file latency significantly exceeds user databases.
-
-.POSSIBLE CAUSES
-
-    Sort spills.
-    Hash spills.
-    Version Store activity.
-
-.NEXT ACTIONS
-
-    Review TempDB Health Toolkit.
-
--------------------------------------------------------------------------------*/
+    Inspect storage latency specifically across all TempDB data and log files.
+-----------------------------------------------------------------------------*/
 
 SELECT
-    mf.name,
-    vfs.num_of_reads,
-    vfs.num_of_writes,
-    vfs.io_stall_read_ms,
-    vfs.io_stall_write_ms
+    mf.name AS LogicalFileName,
+    mf.type_desc AS FileType,
+    mf.physical_name AS PhysicalPath,
+    vfs.num_of_reads AS NumberOfReads,
+    vfs.num_of_writes AS NumberOfWrites,
+    CAST(vfs.io_stall_read_ms AS FLOAT) / NULLIF(vfs.num_of_reads, 0) AS AvgReadLatencyMs,
+    CAST(vfs.io_stall_write_ms AS FLOAT) / NULLIF(vfs.num_of_writes, 0) AS AvgWriteLatencyMs,
+    (vfs.io_stall_read_ms + vfs.io_stall_write_ms) AS TotalStallMs
 FROM sys.dm_io_virtual_file_stats(DB_ID('tempdb'), NULL) vfs
-JOIN tempdb.sys.database_files mf
-    ON vfs.file_id = mf.file_id;
-
+INNER JOIN sys.master_files mf
+    ON vfs.database_id = mf.database_id
+    AND vfs.file_id = mf.file_id
+ORDER BY mf.file_id;
 GO
 
-/*-------------------------------------------------------------------------------
+/*-----------------------------------------------------------------------------
     SECTION 10
-    PAGEIOLATCH ANALYSIS
+    PHYSICAL READ WAITS (PAGEIOLATCH)
 -------------------------------------------------------------------------------
-
 .PURPOSE
+    Review cumulative waits associated with reading data pages from storage.
+-----------------------------------------------------------------------------*/
 
-    Review waits associated with physical reads.
-
-.WHY THIS MATTERS
-
-    Indicates SQL Server waiting on data pages from disk.
-
-.HEALTHY
-
-    Present but not dominant.
-
-.WARNING
-
-    One of the top waits.
-
-.POSSIBLE CAUSES
-
-    Storage latency.
-    Insufficient memory.
-    Large scans.
-
-.NEXT ACTIONS
-
-    Review Memory Health Toolkit.
-    Review file latency.
-
--------------------------------------------------------------------------------*/
-
-SELECT *
+SELECT
+    wait_type,
+    waiting_tasks_count,
+    wait_time_ms,
+    max_wait_time_ms,
+    CAST(wait_time_ms AS FLOAT) / NULLIF(waiting_tasks_count, 0) AS AvgWaitTimeMs
 FROM sys.dm_os_wait_stats
-WHERE wait_type LIKE 'PAGEIOLATCH%';
-
+WHERE wait_type LIKE 'PAGEIOLATCH%'
+ORDER BY wait_time_ms DESC;
 GO
 
-/*-------------------------------------------------------------------------------
+/*-----------------------------------------------------------------------------
     SECTION 11
-    WRITELOG ANALYSIS
+    TRANSACTION LOG FLUSH WAITS (WRITELOG)
 -------------------------------------------------------------------------------
-
 .PURPOSE
+    Review log flush latency. High WRITELOG indicates log disk latency.
+-----------------------------------------------------------------------------*/
 
-    Review waits associated with transaction log writes.
-
-.WHY THIS MATTERS
-
-    Log latency impacts transaction throughput.
-
-.HEALTHY
-
-    WRITELOG not among top waits.
-
-.WARNING
-
-    Significant WRITELOG waits.
-
-.POSSIBLE CAUSES
-
-    Slow log disk.
-    Excessive transaction volume.
-
-.NEXT ACTIONS
-
-    Review log file storage.
-    Review write-intensive workloads.
-
--------------------------------------------------------------------------------*/
-
-SELECT *
+SELECT
+    wait_type,
+    waiting_tasks_count,
+    wait_time_ms,
+    max_wait_time_ms,
+    CAST(wait_time_ms AS FLOAT) / NULLIF(waiting_tasks_count, 0) AS AvgWaitTimeMs
 FROM sys.dm_os_wait_stats
 WHERE wait_type = 'WRITELOG';
-
 GO
 
-/*-------------------------------------------------------------------------------
+/*-----------------------------------------------------------------------------
     SECTION 12
-    STORAGE FILE ANALYSIS
+    PHYSICAL FILE LAYOUT & GROWTH CONFIGURATION
 -------------------------------------------------------------------------------
-
 .PURPOSE
-
-    Review physical file layout.
-
-.WHY THIS MATTERS
-
-    Data and log files should be properly distributed.
-
-.WARNING
-
-    Excessive growth events.
-    Large files on slow disks.
-
-.NEXT ACTIONS
-
-    Review storage architecture.
-
--------------------------------------------------------------------------------*/
+    Review file locations, sizing, and autogrowth settings across all databases.
+-----------------------------------------------------------------------------*/
 
 SELECT
     DB_NAME(database_id) AS DatabaseName,
-    name,
-    physical_name,
-    size/128 AS SizeMB,
-    growth,
-    type_desc
+    name AS LogicalFileName,
+    type_desc AS FileType,
+    size * 8 / 1024 AS SizeMB,
+    CASE
+        WHEN is_percent_growth = 1 THEN CAST(growth AS VARCHAR(10)) + '%'
+        ELSE CAST(growth * 8 / 1024 AS VARCHAR(10)) + ' MB'
+    END AS AutoGrowthSetting,
+    physical_name AS PhysicalFilePath
 FROM sys.master_files
-ORDER BY database_id;
-
+ORDER BY database_id, file_id;
 GO
 
-/*------------------------------------------------------------------------------
+/*-----------------------------------------------------------------------------
     SECTION 13
-    I/O WAIT STATISTICS REVIEW
+    STORAGE-RELATED WAIT STATISTICS
 -------------------------------------------------------------------------------
-
 .PURPOSE
+    Review top storage and disk I/O wait categories.
+-----------------------------------------------------------------------------*/
 
-    Review waits commonly associated with storage bottlenecks.
-
-.KEY WAITS
-
-    PAGEIOLATCH_SH
-    PAGEIOLATCH_EX
-    WRITELOG
-    IO_COMPLETION
-
-.WARNING
-
-    Dominant I/O waits.
-
-.NEXT ACTIONS
-
-    Correlate waits with file latency metrics.
-
--------------------------------------------------------------------------------*/
-
-SELECT TOP 25
+SELECT
     wait_type,
+    waiting_tasks_count,
     wait_time_ms,
     signal_wait_time_ms,
-    waiting_tasks_count
+    max_wait_time_ms,
+    CAST(wait_time_ms AS FLOAT) / NULLIF(waiting_tasks_count, 0) AS AvgWaitTimeMs
 FROM sys.dm_os_wait_stats
 WHERE wait_type IN
 (
     'PAGEIOLATCH_SH',
     'PAGEIOLATCH_EX',
+    'PAGEIOLATCH_UP',
     'WRITELOG',
-    'IO_COMPLETION'
+    'IO_COMPLETION',
+    'ASYNC_IO_COMPLETION'
 )
 ORDER BY wait_time_ms DESC;
+GO
 
+/*-----------------------------------------------------------------------------
+    SECTION 14
+    EXECUTIVE SUMMARY
+-------------------------------------------------------------------------------
+.PURPOSE
+    High-level storage and I/O summary.
+-----------------------------------------------------------------------------*/
+
+SELECT
+    (SELECT DATEDIFF(DAY, sqlserver_start_time, GETDATE()) FROM sys.dm_os_sys_info) AS UptimeDays,
+    (SELECT SUM(io_stall_read_ms + io_stall_write_ms) FROM sys.dm_io_virtual_file_stats(NULL, NULL)) AS TotalInstanceStallMs,
+    (SELECT SUM(wait_time_ms) FROM sys.dm_os_wait_stats WHERE wait_type LIKE 'PAGEIOLATCH%') AS TotalPageIOLatchWaitMs,
+    (SELECT SUM(wait_time_ms) FROM sys.dm_os_wait_stats WHERE wait_type = 'WRITELOG') AS TotalWriteLogWaitMs;
 GO
 
 /******************************************************************************
 FINAL DBA TRIAGE MATRIX
-*******************************************************************************
-
-STORAGE BOTTLENECK
-
-INDICATORS
-
-    High Read Latency
-
-    High PAGEIOLATCH waits
-
-REVIEW
-
-    Sections 1, 2, 10 and 13
-
-------------------------------------------------------------------------------
-TRANSACTION LOG BOTTLENECK
-
-INDICATORS
-
-    High WRITELOG waits
-
-    High Write Latency
-
-REVIEW
-
-    Sections 2, 5 and 11
-
-------------------------------------------------------------------------------
-QUERY DESIGN ISSUE
-
-INDICATORS
-
-    Excessive Logical Reads
-
-    Excessive Physical Reads
-
-REVIEW
-
-    Sections 6 and 8
-
-------------------------------------------------------------------------------
-TEMPD B PRESSURE
-
-INDICATORS
-
-    TempDB latency
-
-    TempDB-heavy workloads
-
-REVIEW
-
-    Section 9
-
-------------------------------------------------------------------------------
-MEMORY MAY BE ROOT CAUSE
-
-INDICATORS
-
-    PAGEIOLATCH waits
-
-    Low PLE
-
-    Memory Pressure
-
-REVIEW
-
-    Health Memory Toolkit
-
-******************************************************************************
-END OF IO HEALTH CHECK
+-------------------------------------------------------------------------------
+STORAGE SYMPTOM                     ACTIONABLE NEXT STEP
+-------------------------------------------------------------------------------
+High PAGEIOLATCH Read Latency (>20ms)--> Review slow disks, add memory, tune queries
+High WRITELOG Wait Time (>10ms avg)  --> Move transaction logs to faster storage / SSD
+TempDB High I/O Stalls               --> Review Toolkit TempDB.sql & add data files
+High Percent Autogrowth on Large DB  --> Switch autogrowth to fixed MB chunks (e.g. 512MB/1GB)
 ******************************************************************************/
