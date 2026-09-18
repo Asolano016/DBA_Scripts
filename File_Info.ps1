@@ -1,5 +1,5 @@
 Clear-Host
-$Folder = "C:\Users\asolanoa\OneDrive - DPDHL\DBA\01_GitRepositories\DBA_Scripts\01_Monitoring\04_Health"
+$Folder = "C:\Users\asolanoa\OneDrive - DPDHL\DBA\01_GitRepositories\DBA_Scripts\02_Performance"
 
 Get-ChildItem -Path $Folder -File | ForEach-Object {
 

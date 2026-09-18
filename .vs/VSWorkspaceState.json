@@ -1,10 +1,9 @@
 {
   "ExpandedNodes": [
     "",
-    "\\01_Monitoring",
-    "\\01_Monitoring\\04_Health_Toolkits",
+    "\\04_Backup-Restore",
     "\\13 - SQLInventory"
   ],
-  "SelectedNode": "\\01_Monitoring\\01_Sessions",
+  "SelectedNode": "\\04_Backup-Restore\\Restore Database (Simple).sql",
   "PreviewInSolutionExplorer": false
 }
