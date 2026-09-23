@@ -384,11 +384,11 @@ HADR_SYNC_COMMIT High Avg Wait      --> Network round-trip latency between sync 
 ******************************************************************************/
 
 
-    redo_queue_size
+SELECT redo_queue_size
 
 FROM sys.dm_hadr_database_replica_states
 
-ORDER BY DatabaseName;
+ORDER BY database_id;
 
 GO
 

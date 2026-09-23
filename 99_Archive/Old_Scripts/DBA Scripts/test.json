@@ -1,0 +1,7 @@
+{
+    "code": 6,
+    "newpassword": null,
+    "expiredate": null,
+    "message": "Code: 5. Message: Reset password failed because: Cannot alter the login 'AndresTestX', because it does not exist or you do not have permission. On instance: CZCHOWS6383\nCode: 4. Message: Reset password failed because: The login 'AndresTest' does not exist. On instance: CZCHOWS6384.\nCode: 4. Message: Reset password failed because: The login 'AndresTest' does not exist. On instance: CZSTLWS0475."
+}
+  

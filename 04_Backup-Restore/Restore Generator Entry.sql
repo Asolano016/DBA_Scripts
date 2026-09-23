@@ -44,7 +44,7 @@ SELECT d.DatabaseName
 	  ,l.LogLogicalName
 	  ,d.DataFolder
 	  ,l.LogFolder
-	  ,"('" + d.DatabaseName + "', '" + d.DataLogicalName + "', '" + l.LogLogicalName + "', '" + d.DataFolder + "', '" + l.LogFolder + "'),'" AS RestoreGeneratorEntry
+	  ,"('" + d.DatabaseName + "', '" + d.DatabaseName + "', '" + d.DatabaseName + "_Backup', '" + d.DataLogicalName + "', '" + l.LogLogicalName + "', '" + d.DataFolder + "', '" + l.LogFolder + "')," AS RestoreGeneratorEntry
 FROM DataFiles d
 INNER JOIN LogFiles l ON d.DatabaseName = l.DatabaseName
 WHERE d.DatabaseName NOT IN

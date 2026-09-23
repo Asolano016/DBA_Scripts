@@ -41,6 +41,31 @@ RECOMMENDED TROUBLESHOOTING SEQUENCE
     6. PLE by NUMA Node
     7. Memory Clerks & Buffer Pool Distribution
 
+HOW TO READ THIS SCRIPT
+
+    Use this script in order from Section 1 to Section 13. The first checks answer
+    the basic questions: is SQL Server under OS memory pressure, is it using the
+    configured memory, and are queries waiting on memory grants?
+
+    After the overview checks, correlate the symptoms across the sections:
+
+    - Total Server Memory far below Target Server Memory generally means SQL Server
+      is under-using its memory ceiling, or that another workload is competing for RAM.
+    - process_physical_memory_low = 1 indicates OS memory pressure; review max server
+      memory configuration and non-SQL memory consumers.
+    - Waiting Memory Grants > 0 indicates grant contention; focus on Sections 5B and 6.
+    - GrantedMB far above MaxUsedMB suggests the query is overestimating row counts,
+      often because of stale statistics, poor cardinality estimates, or inefficient plans.
+    - Low or declining PLE values suggest buffer pool churn, large scans, or memory strain.
+    - Large ad-hoc or single-use plans indicate plan cache bloat and poor parameterization.
+    - A dominant buffer pool with poor plan reuse usually indicates workload pressure,
+      not just a lack of physical RAM.
+
+    The strongest diagnosis comes from reviewing multiple sections together rather than
+    interpreting a single metric in isolation. A healthy memory condition typically
+    shows stable memory configuration, low waiting grants, reasonable PLE, and no severe
+    ad-hoc plan cache explosion.
+
 ******************************************************************************/
 
 /*-----------------------------------------------------------------------------
@@ -267,7 +292,24 @@ GO
     HISTORICAL TOP MEMORY GRANTS
 -------------------------------------------------------------------------------
 .PURPOSE
-    Identify queries historically requesting the largest memory grants.
+    Identify queries that historically requested the largest memory grants.
+
+.WHY THIS MATTERS
+    Recurring heavy grant requests often point to queries with unstable plans,
+    stale statistics, or poor cardinality estimates that hit the server repeatedly.
+
+.HEALTHY
+    MaxGrantMB and MaxUsedGrantMB are close together, and no single query dominates.
+
+.WARNING
+    Large gap between grant size and actual usage, or a few queries repeatedly at the top.
+
+.POSSIBLE CAUSES
+    Overestimated row counts, stale stats, parameter sniffing, missing indexes,
+    inefficient hash/sort operations.
+
+.NEXT ACTIONS
+    Review execution plans, update statistics, and tune the top memory-heavy queries.
 -----------------------------------------------------------------------------*/
 
 SELECT TOP (20)
@@ -305,7 +347,15 @@ GO
     PLE is stable and exceeds (Data Cache GB / 4 GB) * 300 seconds per node.
 
 .WARNING
-    Sudden steep drop or continuous low values (<300s).
+    Sudden steep drop or continuous low values (<300s), especially on one NUMA node.
+
+.POSSIBLE CAUSES
+    Large scans, missing indexes, memory pressure, skewed workload distribution,
+    cache churn across a subset of NUMA nodes.
+
+.NEXT ACTIONS
+    Review the workload per NUMA node, check missing indexes, and investigate queries
+    causing repeated buffer pool churn.
 -----------------------------------------------------------------------------*/
 
 SELECT
@@ -323,6 +373,25 @@ GO
 -------------------------------------------------------------------------------
 .PURPOSE
     Analyze how execution plan cache memory is divided across object types.
+
+.WHY THIS MATTERS
+    A large plan cache can be healthy, but abnormal growth in one object family often
+    points to bad parameterization, repeated compile churn, or cache pollution.
+
+.HEALTHY
+    Cache is distributed reasonably and ad-hoc / single-use plans are not dominating.
+
+.WARNING
+    Very large single-use or ad-hoc plan contribution, or plan cache dominated by a few
+    object types with repeated churn.
+
+.POSSIBLE CAUSES
+    Literal-based queries, poor parameterization, ORM-generated SQL, excessive recompiles,
+    application-level query churn.
+
+.NEXT ACTIONS
+    Review ad-hoc plan growth, parameterize frequently repeated queries, and check for
+    unnecessary recompile patterns.
 -----------------------------------------------------------------------------*/
 
 SELECT
@@ -342,6 +411,23 @@ GO
 -------------------------------------------------------------------------------
 .PURPOSE
     Measure memory consumed specifically by single-use ad-hoc plans.
+
+.WHY THIS MATTERS
+    Ad-hoc SQL is often the main source of plan cache bloat. Large single-use plans can
+    consume significant memory without providing reuse value.
+
+.HEALTHY
+    Ad-hoc plans are a small share of the plan cache, and most queries are reused.
+
+.WARNING
+    High TotalAdhocPlans, large AdhocCacheMB, or SingleUseAdhocMB growing into GBs.
+
+.POSSIBLE CAUSES
+    Literal-based SQL, poor parameterization, dynamic SQL generation, ORMs, reporting tools.
+
+.NEXT ACTIONS
+    Enable optimize for ad hoc workloads, improve parameterization, and review the most
+    common SQL text patterns driving plan churn.
 -----------------------------------------------------------------------------*/
 
 SELECT
@@ -359,6 +445,23 @@ GO
 -------------------------------------------------------------------------------
 .PURPOSE
     Identify databases consuming Buffer Pool RAM.
+
+.WHY THIS MATTERS
+    Buffer pool usage shows which databases are actively caching pages in memory. A single
+    database dominating the buffer pool may be driving memory pressure or heavy scan activity.
+
+.HEALTHY
+    Memory usage is spread across active databases in a way that matches workload demand.
+
+.WARNING
+    One database unexpectedly owns most of the buffer pool, especially when no corresponding
+    workload pattern explains it.
+
+.POSSIBLE CAUSES
+    Large scans, reporting workloads, ETL spikes, poor indexing, tempdb-related churn.
+
+.NEXT ACTIONS
+    Investigate the dominant database, review index efficiency, and correlate with query activity.
 
 .CAUTION
     Scanning sys.dm_os_buffer_descriptors iterates over all memory buffers.
@@ -380,7 +483,11 @@ GO
     QUERY RESOURCE SEMAPHORES
 -------------------------------------------------------------------------------
 .PURPOSE
-    Monitor memory grant resource pool semaphores.
+    Monitor memory grant resource pool semaphores and query queue pressure.
+
+.WHY THIS MATTERS
+    Resource semaphores show whether SQL Server is exhausting grant memory and forcing queries
+    to wait for a grant slot. This is the direct signal of memory grant contention.
 
 .KEY METRICS
     target_memory_kb: Memory target for grants.
@@ -391,7 +498,16 @@ GO
     waiter_count: Queries blocked waiting for grants.
 
 .HEALTHY
-    waiter_count = 0.
+    waiter_count = 0 and available_memory_kb remains consistent.
+
+.WARNING
+    waiter_count > 0, available_memory_kb low, or many queries queued behind a few grant holders.
+
+.POSSIBLE CAUSES
+    Large sorts, hash joins, memory-intensive plans, bad estimates, too many concurrent big queries.
+
+.NEXT ACTIONS
+    Review active and waiting memory grants, then identify the queries consuming the largest grants.
 -----------------------------------------------------------------------------*/
 
 SELECT
@@ -413,7 +529,26 @@ GO
     EXECUTIVE SUMMARY
 -------------------------------------------------------------------------------
 .PURPOSE
-    Provide high-level memory health summary.
+    Provide a quick memory health assessment for triage and action prioritization.
+
+.WHY THIS MATTERS
+    This summary gives the first-pass answer: is the system under memory pressure,
+    is memory grant contention active, and does the current picture align with a healthy setup?
+
+.HEALTHY
+    Total Server Memory is close to Target Server Memory, WaitingMemoryGrants = 0,
+    and OSMemoryPressureFlag = 0.
+
+.WARNING
+    WaitingMemoryGrants > 0, OSMemoryPressureFlag = 1, or Total Server Memory is far below target.
+
+.POSSIBLE CAUSES
+    Memory pressure from the OS, grant contention, poor plan reuse, large scans,
+    or excessive ad-hoc SQL.
+
+.NEXT ACTIONS
+    Use this section as the entry point: if the summary is negative, drill into the relevant
+    sections for grants, plan cache, PLE, and configuration.
 -----------------------------------------------------------------------------*/
 
 SELECT
@@ -422,449 +557,4 @@ SELECT
     (SELECT physical_memory_in_use_kb / 1024 FROM sys.dm_os_process_memory) AS ProcessMemoryInUseMB,
     (SELECT COUNT(*) FROM sys.dm_exec_query_memory_grants WHERE grant_time IS NULL) AS WaitingMemoryGrants,
     (SELECT process_physical_memory_low FROM sys.dm_os_process_memory) AS OSMemoryPressureFlag;
-GO
-
-/******************************************************************************
-FINAL DBA TRIAGE MATRIX
--------------------------------------------------------------------------------
-MEMORY SYMPTOM                      ACTIONABLE NEXT STEP
--------------------------------------------------------------------------------
-Waiting Memory Grants > 0           --> Review Active Grants (5B) & Schedulers
-process_physical_memory_low = 1     --> OS memory starvation; review Max Server Memory
-Steep PLE Drop on specific NUMA     --> Large table scan on node; check Missing Indexes
-High Adhoc Single-Use MB (>1 GB)    --> Enable 'optimize for ad hoc workloads'
-High CACHESTORE_SQLCP               --> Investigate unparameterized dynamic queries
-******************************************************************************/
-
-
-    Poor cardinality estimates
-    Outdated statistics
-    Missing indexes
-
-.NEXT ACTIONS
-
-    Review execution plans.
-    Update statistics.
-    Tune queries and indexes.
-
--------------------------------------------------------------------------------*/
-
-SELECT mg.granted_memory_kb / 1024 AS GrantedMB
-      ,mg.session_id
-      ,t.text
-      ,qp.query_plan
-FROM sys.dm_exec_query_memory_grants AS mg
-CROSS APPLY sys.dm_exec_sql_text(mg.sql_handle) AS t
-CROSS APPLY sys.dm_exec_query_plan(mg.plan_handle) AS qp
-ORDER BY mg.granted_memory_kb DESC
-GO
-
-/*-----------------------------------------------------------------------------
-    SECTION 5B
-    ACTIVEMEMORY GRANTS
------------------------------------------------------------------------------
-
-.PURPOSE
-    Show queries currently holdingmemory grants.
-
-.WHY THIS MATTERS
-    Excessive grants can reduce concurrency and delay other queries.
-.KEY METRICS
-
-    RequestedMB
-
-    GrantedMB
-
-    UsedMB
-
-    MaxUsedMB
-
-.HEALTHY
-
-    GrantedMB is close to UsedMB.
-
-.WARNING
-
-    GrantedMB significantly exceeds UsedMB.
-
-.POSSIBLE CAUSES
-
-    Stale statistics
-    Cardinality estimation issues
-    Parameter sniffing
-    Inefficient execution plans
-
-.NEXT ACTIONS
-
-    Capture execution plans.
-    Compare estimated versus actual rows.
-    Review statistics quality.
-
--------------------------------------------------------------------------------*/
-
-SELECT mg.session_id
-      ,mg.requested_memory_kb / 1024 AS RequestedMB
-      ,mg.granted_memory_kb / 1024 AS GrantedMB
-      ,mg.used_memory_kb / 1024 AS UsedMB
-      ,mg.max_used_memory_kb / 1024 AS MaxUsedMB
-      ,r.status
-      ,DB_NAME(r.database_id) AS DatabaseName
-      ,t.text
-FROM sys.dm_exec_query_memory_grants mg
-LEFT JOIN sys.dm_exec_requests r ON mg.session_id = r.session_id
-OUTER APPLY sys.dm_exec_sql_text(mg.sql_handle) t
-ORDER BY mg.granted_memory_kb DESC;
-GO
-
-/*-------------------------------------------------------------------------------
-    SECTION 6
-    WAITING MEMORY GRANTS
--------------------------------------------------------------------------------
-
-.PURPOSE
-
-    Identify queries waiting for memory grants.
-
-.WHY THIS MATTERS
-
-    Waiting memory grants indicate query memory contention.
-
-.HEALTHY
-
-    No rows returned.
-
-.WARNING
-
-    One or more waiting sessions.
-
-.POSSIBLE CAUSES
-
-    Large Sort operations
-    Hash Join operations
-    Index maintenance
-    Excessive active grants
-
-.NEXT ACTIONS
-
-    Review Sections 5, 5A and 12.
-    Analyze memory-intensive queries.
-
--------------------------------------------------------------------------------*/
-
-SELECT *
-FROM sys.dm_exec_query_memory_grants
-WHERE grant_time IS NULL;
-GO
-
-/*-------------------------------------------------------------------------------
-    SECTION 7
-    HISTORICAL TOP MEMORY GRANTS
--------------------------------------------------------------------------------
-
-.PURPOSE
-
-    Identify historically expensive memory consumers.
-
-.WHY THIS MATTERS
-
-    Helps locate recurring memory-intensive queries.
-
-.HEALTHY
-
-    MaxGrantMB is reasonably aligned with MaxUsedGrantMB.
-
-.WARNING
-
-    Large differences between grant size and actual usage.
-
-.POSSIBLE CAUSES
-
-    Overestimated cardinality
-    Poor query design
-    Missing indexes
-
-.NEXT ACTIONS
-
-    Review execution plans.
-    Validate statistics.
-    Consider query tuning.
-
--------------------------------------------------------------------------------*/
-
-SELECT TOP (20) qs.max_grant_kb / 1024 AS MaxGrantMB
-       ,qs.max_used_grant_kb / 1024 AS MaxUsedGrantMB
-       ,qs.execution_count
-       ,st.text
-FROM sys.dm_exec_query_stats qs
-CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
-ORDER BY qs.max_grant_kb DESC;
-
-GO
-
-/*-----------------------------------------------------------------------------
-    SECTION 8
-    PAGE LIFE EXPECTANCY (PLE)
--------------------------------------------------------------------------------
-
-.PURPOSE
-
-    Measure how long pages remain in Buffer Pool.
-
-.WHY THIS MATTERS
-
-    Sudden drops often indicate increased memory pressure.
-
-.HEALTHY
-
-    Stable or consistently increasing values.
-
-.WARNING
-
-    Continuous or sudden declines.
-
-.POSSIBLE CAUSES
-
-    Large scans
-    Missing indexes
-    Memory pressure
-    Workload spikes
-
-.NEXT ACTIONS
-
-    Review query activity.
-    Review Buffer Pool usage.
-    Review missing indexes.
-
--------------------------------------------------------------------------------*/
-
-SELECT cntr_value AS PageLifeExpectancy
-FROM sys.dm_os_performance_counters
-WHERE counter_name = 'Page life expectancy';
-GO
-
-/*-------------------------------------------------------------------------------
-    SECTION 9
-    PLAN CACHE DISTRIBUTION
--------------------------------------------------------------------------------
-
-.PURPOSE
-
-    Understand how execution plan cache memory is distributed.
-
-.COMMON TYPES
-
-    Proc
-    Prepared
-    Adhoc
-
-.WARNING
-
-    Excessive Adhoc plans often indicate cache pollution.
-
-.NEXT ACTIONS
-
-    Review Adhoc cache growth.
-    Review application parameterization practices.
-
--------------------------------------------------------------------------------*/
-
-SELECT objtype
-      ,COUNT(*) AS Plans
-      ,SUM(size_in_bytes) / 1024 / 1024 AS SizeMB
-FROM sys.dm_exec_cached_plans
-GROUP BY objtype
-ORDER BY SizeMB DESC;
-GO
-
-/*-------------------------------------------------------------------------------
-    SECTION 10
-    ADHOC PLAN CACHE ANALYSIS
--------------------------------------------------------------------------------
-
-.PURPOSE
-
-    Measure memory consumed specifically by Adhoc plans.
-
-.WHY THIS MATTERS
-
-    Adhoc plans can waste significant memory.
-
-.HEALTHY
-
-    Adhoc plans represent a small percentage of plan cache.
-
-.WARNING
-
-    Thousands of single-use plans.
-    Multiple GB consumed by Adhoc cache.
-
-.POSSIBLE CAUSES
-
-    Literal-based queries
-    Poor parameterization strategy
-
-.NEXT ACTIONS
-
-    Review Optimize for Ad Hoc Workloads.
-    Review Forced Parameterization.
-
--------------------------------------------------------------------------------*/
-
-SELECT COUNT(*) AS NumberOfPlans
-      ,SUM(size_in_bytes) / 1024 / 1024 AS CacheSizeMB
-FROM sys.dm_exec_cached_plans
-WHERE objtype = 'Adhoc';
-GO
-
-/*-------------------------------------------------------------------------------
-    SECTION 11
-    BUFFER POOL DISTRIBUTION BY DATABASE
--------------------------------------------------------------------------------
-
-.PURPOSE
-
-    Identify databases consuming Buffer Pool memory.
-
-.WHY THIS MATTERS
-
-    Helps determine workload distribution across databases.
-
-.HEALTHY
-
-    Largest consumers correlate with most active databases.
-
-.WARNING
-
-    Unexpected database consuming a large portion of memory.
-
-.POSSIBLE CAUSES
-
-    Large scans
-    Reporting workloads
-    ETL activity
-
-.NEXT ACTIONS
-
-    Investigate workload patterns.
-    Review index efficiency.
-
--------------------------------------------------------------------------------*/
-
-SELECT DB_NAME(database_id) AS DatabaseName
-      ,COUNT(*) * 8 / 1024 AS CachedMB
-FROM sys.dm_os_buffer_descriptors
-WHERE database_id <> 32767
-GROUP BY database_id
-ORDER BY CachedMB DESC;
-GO
-
-/*-------------------------------------------------------------------------------
-    SECTION 12
-    RESOURCE SEMAPHORES
--------------------------------------------------------------------------------
-
-.PURPOSE
-
-    Monitor memory grant resource availability.
-
-.WHY THIS MATTERS
-
-    Resource Semaphores control query memory grants.
-
-.KEY METRICS
-
-    available_memory_kb
-
-    granted_memory_kb
-
-    grantee_count
-
-    waiter_count
-
-.HEALTHY
-
-    waiter_count = 0
-
-.WARNING
-
-    waiter_count > 0
-
-.POSSIBLE CAUSES
-
-    Memory grant contention
-    Large sorting operations
-    Hash processing
-    Query overestimation
-
-.NEXT ACTIONS
-
-    Review Active Memory Grants.
-    Review Waiting Memory Grants.
-    Identify largest grant consumers.
-
--------------------------------------------------------------------------------*/
-
-SELECT *
-FROM sys.dm_exec_query_resource_semaphores;
-GO
-
-/*-------------------------------------------------------------------------------
-    SECTION 13
-    EXECUTIVE SUMMARY
--------------------------------------------------------------------------------
-
-.PURPOSE
-
-    Provide a quick memory health assessment.
-
-.HEALTHY ENVIRONMENT
-
-    TotalMemory approximately equals TargetMemory.
-
-    WaitingMemoryGrants = 0.
-
-    process_physical_memory_low = 0.
-
-    Stable Page Life Expectancy.
-
-    Buffer Pool is largest memory consumer.
-
-.INVESTIGATE
-
-    WaitingMemoryGrants > 0.
-
-    process_physical_memory_low = 1.
-
-    Repeated PLE declines.
-
-    Excessive Adhoc cache.
-
-    Large memory grant overestimations.
-
-.NEXT ACTIONS
-
-    Memory Grants:
-        Review Sections 5, 5A, 6 and 12.
-
-    Plan Cache:
-        Review Sections 9 and 10.
-
-    Memory Pressure:
-        Review Sections 1 and 2.
-
--------------------------------------------------------------------------------*/
-
-SELECT (SELECT cntr_value / 1024
-        FROM sys.dm_os_performance_counters
-        WHERE counter_name = 'Total Server Memory (KB)'
-        AND object_name LIKE '%Memory Manager%') AS TotalMemoryMB
-      ,(SELECT cntr_value / 1024
-        FROM sys.dm_os_performance_counters
-        WHERE counter_name = 'Target Server Memory (KB)'
-        AND object_name LIKE '%Memory Manager%') AS TargetMemoryMB
-      ,(SELECT physical_memory_in_use_kb / 1024
-        FROM sys.dm_os_process_memory) AS ProcessMemoryMB
-      ,(SELECT COUNT(*)
-        FROM sys.dm_exec_query_memory_grants
-        WHERE grant_time IS NULL) AS WaitingMemoryGrants;
 GO

@@ -26,25 +26,25 @@ DECLARE @counter INT = 1,
 WHILE @counter <= (SELECT COUNT(*) FROM @tempJob)
 BEGIN
 
-	SET @query = "--Create schedule for:  " +( SELECT name FROM @tempJob WHERE id = @counter) + "
-				  DECLARE @schedule_id int
-				  EXEC msdb.dbo.sp_add_jobschedule @job_id=N'" + (SELECT jobid FROM @tempJob WHERE id = @counter) + "', @name=N'OneTimeExecution', 
-				  		@enabled=1, 
-				  		@freq_type=1, 
-				  		@freq_interval=1, 
-				  		@freq_subday_type=0, 
-				  		@freq_subday_interval=0, 
-				  		@freq_relative_interval=0, 
-				  		@freq_recurrence_factor=1, 
-				  		@active_start_date=20191120, 
-				  		@active_end_date=99991231, 
-				  		@active_start_time=43000, 
-				  		@active_end_time=235959, @schedule_id = @schedule_id OUTPUT
-				  --select @schedule_id
-				  GO
-				  "
+	SET @query = "
+--Create schedule for:  " +( SELECT name FROM @tempJob WHERE id = @counter) + "
+DECLARE @schedule_id int
+EXEC msdb.dbo.sp_add_jobschedule @job_id=N'" + (SELECT jobid FROM @tempJob WHERE id = @counter) + "', @name=N'OneTimeExecution', 
+		@enabled=1, 
+		@freq_type=1, 
+		@freq_interval=1, 
+		@freq_subday_type=0, 
+		@freq_subday_interval=0, 
+		@freq_relative_interval=0, 
+		@freq_recurrence_factor=1, 
+		@active_start_date=20191120, 
+		@active_end_date=99991231, 
+		@active_start_time=43000, 
+		@active_end_time=235959, @schedule_id = @schedule_id OUTPUT
+--select @schedule_id
+GO
+"
 	PRINT @query
-
 	--EXEC sp_executesql @query
 
 	SET @counter = @counter + 1;
